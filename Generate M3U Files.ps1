@@ -29,7 +29,7 @@ NOTES
     You may need to delete .m3u files you know you don't need if the output indicates any were created
 #>
 
-# Retrieve the directory where the script resides
+# Retrieve the directory where the script resides (this will be the root starting location for the search)
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 # Folder names to skip entirely (case-insensitive, exact match)
@@ -122,5 +122,6 @@ foreach ($group in $groups) {
 
     Write-Host "Created playlist: $playlistPath"
 }
+
 
 
