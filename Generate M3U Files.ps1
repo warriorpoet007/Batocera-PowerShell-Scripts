@@ -11,7 +11,7 @@ FUNCTIONAL BREAKDOWN
 - Filters the file list by those with "disk" or "disc" in the filename
 - Filters the list by those with a number or letter designator after "disk" or "disc" at the end of the filename
     Accommodates a space or underscore between "disk/disc" and the number or letter designator
-    Accommodates a closing ")" between the number/letter designator and the filename extension
+    Accommodates a closing parenthesis ")" between the number/letter designator and the filename extension
     Accommodates filenames that include a numbered disk of total disks (e.g., Disk 1 of 4)
     Accommodates filenames that include a Side A and B
     Skips common media subfolders (e.g., media, images, video, manuals, downloaded_images, etc.)
@@ -122,3 +122,4 @@ foreach ($group in $groups) {
 
     Write-Host "Created playlist: $playlistPath"
 }
+
