@@ -17,8 +17,8 @@ BREAKDOWN
      - Skips common media/manual folders (e.g., images, videos, media, manuals, downloaded_*) to reduce false multi-disk detections
 - Detects multi-disk candidates by parsing filenames for “designators”
      - A designator is a disk/disc/side marker that indicates a set (case-insensitive), such as:
-          - Disk 1, Disc B, Disk II, Disk 2 of 6, Disk 4 Side A
-          - Side-only sets like Side A, Side B are supported (treated as Disk 1 with different sides)
+          - Disk 1, Disc B, Disk II, Disk 2 of 6, Disk 4 Side A, etc.
+          - Side-only sets like Side A, Side B, etc. are supported (treated as Disk 1 with different sides)
      - Supports disk tokens as:
           - Numbers (1, 2, …)
           - Letters (A, B, …)
@@ -28,7 +28,7 @@ BREAKDOWN
           - Side X paired with a disk marker (e.g., Disk 2 Side B)
 - Extracts and interprets bracket tags for grouping and playlist naming
      - Separates tags into:
-          - Alt tags like [a], [a2], [b], [b3] (TOSEC-style)
+          - Alt tags like [a], [a2], [b], [b3] (TOSEC-style), etc.
           - Other base tags like [cr ...], [! ], etc.
      - Uses a “non-bang” compatibility key:
           - Treats sets as compatible when only [!] differs across files (helpful when some disks include [!] and others don’t)
