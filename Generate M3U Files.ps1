@@ -11,7 +11,7 @@ NOTES:
         - A multi-disk file wasn't incorporated into a playlist
 
 BREAKDOWN
-- Enumerates ROM/game files starting in the directory the script resides in
+- Enumerates ROM game files starting in the directory the script resides in
      - Scans up to 2 subdirectory levels deep recursively
      - Skips .m3u files during scanning (so it doesn’t treat playlists as input)
      - Skips common media/manual folders (e.g., images, videos, media, manuals, downloaded_*) to reduce false multi-disk detections
@@ -901,5 +901,6 @@ if ($totalSeconds -lt 60) {
 Write-Host ""
 Write-Host "Runtime:" -ForegroundColor White -NoNewline
 Write-Host " $runtimeText"
+
 
 
