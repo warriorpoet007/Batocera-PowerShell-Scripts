@@ -13,7 +13,6 @@ NOTES:
     - $dryRun : default is $false; set to $true to preview output without modifying files
     - $nonM3UPlatforms : array of platforms (folder names) that should NOT use M3U; default: 3DO + apple2
     - $noM3UPlatformMode : default "XML"; set to "skip" to ignore NON-M3U platforms entirely
-- Bracket tags that simply restate the file extension (e.g., [nib] on a .nib file) are treated as non-grouping noise so they don't fragment otherwise-matching disk/side sets.
 
 BREAKDOWN
 - Enumerates ROM game files starting in the directory the script resides in
@@ -78,6 +77,7 @@ BREAKDOWN
 - Tracks which disk files were “used”
     - Files included in either written playlists or suppressed playlists are marked “used”
     - For NON-M3U platforms, Disk 2+ entries successfully hidden in gamelist.xml are marked “used”
+    - For NON-M3U platforms, entries that are unhidden due to reclassification/incompleteness are marked “used”
     - Remaining parsed multi-disk candidates that weren’t used are reported as:
         - (POSSIBLE) MULTI-DISK FILES SKIPPED, with a reason such as:
         - incomplete disk set
@@ -169,59 +169,49 @@ $noM3UMissingGamelistEntryByFullPath = @{}  # full file path -> $true
 # Use ArrayList buckets to avoid op_Addition crashes in large runs
 $noM3UPrimaryEntriesOk         = [System.Collections.ArrayList]::new() # PSCustomObject { FullPath; Reason }
 $noM3UPrimaryEntriesIncomplete = [System.Collections.ArrayList]::new() # PSCustomObject { FullPath; Reason }
+$noM3UNoDisk1Sets              = [System.Collections.ArrayList]::new() # PSCustomObject { FullPath; Reason }
 
 $noM3UNewlyHidden              = [System.Collections.ArrayList]::new() # PSCustomObject { FullPath; Reason }
 $noM3UAlreadyHidden            = [System.Collections.ArrayList]::new() # PSCustomObject { FullPath; Reason }
+
+$noM3UNewlyUnhidden            = [System.Collections.ArrayList]::new() # PSCustomObject { FullPath; Reason }
+$noM3UAlreadyVisible           = [System.Collections.ArrayList]::new() # PSCustomObject { FullPath; Reason }
+
 $noM3UMissingGamelistEntries   = [System.Collections.ArrayList]::new() # PSCustomObject { FullPath; Reason }
 
 # Establish per-platform count buckets for gamelist changes
-$gamelistHiddenCounts        = @{}  # platform label -> count newly hidden
-$gamelistAlreadyHiddenCounts = @{}  # platform label -> count already hidden (no change)
+$gamelistHiddenCounts          = @{}  # platform label -> count newly hidden
+$gamelistAlreadyHiddenCounts   = @{}  # platform label -> count already hidden (no change)
+
+$gamelistUnhiddenCounts        = @{}  # platform label -> count newly unhidden
+$gamelistAlreadyVisibleCounts  = @{}  # platform label -> count already visible (no change)
 
 # ==================================================================================================
 # FUNCTIONS
 # ==================================================================================================
 
-# --- FUNCTION: Normalize-M3UText ---
-# PURPOSE:
-# - Normalize M3U text for stable equality checks by ignoring BOM and newline style differences.
-# NOTES:
-# - Preserves trailing spaces and trailing blank lines as meaningful differences.
-# - Returns an array of lines (including trailing empty lines).
 function Normalize-M3UText {
     param([AllowNull()][string]$Text)
 
-    # If there's no text, treat as empty list of lines
     if ($null -eq $Text) { return @() }
 
-    # Strip UTF-8 BOM if present (only for equality checks)
     if ($Text.Length -gt 0 -and [int]$Text[0] -eq 0xFEFF) {
         $Text = $Text.Substring(1)
     }
 
-    # Normalize newline style only (CRLF/CR => LF)
     $Text = $Text -replace "`r`n", "`n"
     $Text = $Text -replace "`r", "`n"
 
-    # Split into lines, preserving trailing empty lines
     return ,($Text -split "`n")
 }
 
-# --- FUNCTION: Convert-DiskToSort ---
-# PURPOSE:
-# - Convert a disk token (numeric, letter, roman numeral) into a sortable integer.
-# NOTES:
-# - Returns $null if the token is missing or unrecognized.
 function Convert-DiskToSort {
     param([string]$DiskToken)
 
-    # Guard: empty token means no disk info
     if ([string]::IsNullOrWhiteSpace($DiskToken)) { return $null }
 
-    # Numeric disk token
     if ($DiskToken -match '^\d+$') { return [int]$DiskToken }
 
-    # Roman numeral disk token (1..20) — used only for sort normalization
     $romanMap = @{
         'I' = 1;  'II' = 2;  'III' = 3;  'IV' = 4;  'V' = 5
         'VI' = 6; 'VII' = 7; 'VIII' = 8; 'IX' = 9;  'X' = 10
@@ -232,72 +222,45 @@ function Convert-DiskToSort {
     $upper = $DiskToken.ToUpperInvariant()
     if ($romanMap.ContainsKey($upper)) { return $romanMap[$upper] }
 
-    # Single-letter disk token: A=1, B=2, ...
     if ($upper -match '^[A-Z]$') {
         return ([int][char]$upper[0]) - 64
     }
 
-    # Unknown token type
     return $null
 }
 
-# --- FUNCTION: Convert-SideToSort ---
-# PURPOSE:
-# - Convert a Side token (A/B/...) into a sortable integer (A=1, B=2, ...).
-# NOTES:
-# - Returns 0 when side is missing/blank so “no side” sorts first.
 function Convert-SideToSort {
     param([string]$SideToken)
 
-    # Guard: no side sorts first
     if ([string]::IsNullOrWhiteSpace($SideToken)) { return 0 }
 
     $c = $SideToken.ToUpperInvariant()[0]
     return ([int][char]$c) - 64
 }
 
-# --- FUNCTION: Is-AltTag ---
-# PURPOSE:
-# - Detect TOSEC-style alt tags like [a], [a2], [b], [b3].
-# NOTES:
-# - Used to separate “alt tags” from other bracket tags during parsing.
 function Is-AltTag {
     param([string]$Tag)
     return ($Tag -match '^\[(?i)[ab]\d*\]$')
 }
 
-# --- FUNCTION: Is-DiskNoiseTag ---
-# PURPOSE:
-# - Detect bracketed disk descriptor tags that should not influence grouping (noise).
-# NOTES:
-# - Prevents tags like “[Disk A]” from changing grouping/playlist names.
 function Is-DiskNoiseTag {
     param([string]$Tag)
     return ($Tag -match '^\[(?i)\s*disks?\b')
 }
 
-# --- FUNCTION: Is-ExtensionNoiseTag ---
-# PURPOSE:
-# - Detect bracket tags that restate the file extension (e.g., "[nib]" on a ".nib" file).
-# NOTES:
-# - Prevents format-indicator brackets from fragmenting grouping/playlist naming across mixed-format sets.
-# - Intentionally does not treat TOSEC-style alt tags as extension noise.
 function Is-ExtensionNoiseTag {
     param(
         [Parameter(Mandatory=$true)][string]$Tag,
         [Parameter(Mandatory=$true)][string]$FileName
     )
 
-    # Do not treat alt tags as extension noise
     if (Is-AltTag $Tag) { return $false }
 
-    # Determine extension (without dot)
     $ext = [System.IO.Path]::GetExtension($FileName)
     if ([string]::IsNullOrWhiteSpace($ext)) { return $false }
     $extNoDot = $ext.TrimStart('.')
     if ([string]::IsNullOrWhiteSpace($extNoDot)) { return $false }
 
-    # Extract inner tag content
     $m = [regex]::Match($Tag, '^\[(?<X>[^\]]+)\]$')
     if (-not $m.Success) { return $false }
     $inner = $m.Groups['X'].Value.Trim()
@@ -305,109 +268,66 @@ function Is-ExtensionNoiseTag {
     return ($inner -ieq $extNoDot)
 }
 
-# --- FUNCTION: Clean-BasePrefix ---
-# PURPOSE:
-# - Clean/normalize the filename prefix before the disk designator for stable grouping & naming.
-# NOTES:
-# - Trims trailing punctuation/whitespace and dangling parentheses artifacts.
 function Clean-BasePrefix {
     param([string]$Prefix)
 
-    # Guard: null prefix becomes empty string
     if ($null -eq $Prefix) { return "" }
 
     $p = $Prefix.Trim()
-
-    # Remove common trailing separators/periods/underscores/dashes
     $p = $p -replace '[\s._-]+$', ''
-
-    # Remove dangling "(" at end (artifact from split patterns)
     $p = $p -replace '\(\s*$', ''
 
     return $p.Trim()
 }
 
-# --- FUNCTION: Write-Phase ---
-# PURPOSE:
-# - Print a short “phase banner” so long operations don’t look like the script is hanging.
-# NOTES:
-# - Pure console output helper (no behavioral impact).
 function Write-Phase {
     param([string]$Text)
     Write-Host ""
     Write-Host $Text -ForegroundColor Cyan
 }
 
-# --- FUNCTION: Get-AltFallbackChain ---
-# PURPOSE:
-# - Build an ordered alt fallback chain (e.g., [a2] -> [a] -> base) used during disk filling.
-# NOTES:
-# - Always ends with "" (base/no-alt) as the final fallback.
 function Get-AltFallbackChain {
     param([string]$AltKey)
 
-    # If there is no alt, only consider base
     if ([string]::IsNullOrWhiteSpace($AltKey)) { return @("") }
 
-    # Parse [a2] / [b] patterns
     $m = [regex]::Match($AltKey, '^\[(?i)(?<L>[ab])(?<N>\d*)\]$')
     if (-not $m.Success) { return @($AltKey, "") }
 
     $letter = $m.Groups['L'].Value.ToLowerInvariant()
     $num = $m.Groups['N'].Value
 
-    # [a] => [a], base
     if ([string]::IsNullOrWhiteSpace($num)) {
         return @($AltKey, "")
     }
 
-    # [a2] => [a2], [a], base
     return @($AltKey, "[$letter]", "")
 }
 
-# --- FUNCTION: Get-NonBangTagsKey ---
-# PURPOSE:
-# - Produce a tag key that ignores [!] so sets can match across files that differ only by [!].
-# NOTES:
-# - Used for “relaxed” compatibility matching during selection.
 function Get-NonBangTagsKey {
     param([string]$BaseTagsKey)
     if ([string]::IsNullOrWhiteSpace($BaseTagsKey)) { return "" }
     return ($BaseTagsKey -replace '\[\!\]', '')
 }
 
-# --- FUNCTION: Normalize-Alt ---
-# PURPOSE:
-# - Normalize alt tags so blank/whitespace becomes $null for stable comparisons.
-# NOTES:
-# - Ensures comparisons don’t treat "" and $null as different alts.
 function Normalize-Alt {
     param([AllowNull()][AllowEmptyString()][string]$Alt)
     if ([string]::IsNullOrWhiteSpace($Alt)) { return $null }
     return $Alt
 }
 
-# --- FUNCTION: Get-PlatformRootName ---
-# PURPOSE:
-# - Determine the platform folder name (e.g., "apple2") based on script location and file directory.
-# NOTES:
-# - If script is run from roms root, platform is the first child folder under roms.
-# - If script is run inside a platform folder, that folder name is the platform.
 function Get-PlatformRootName {
     param(
         [Parameter(Mandatory=$true)][string]$Directory,
         [Parameter(Mandatory=$true)][string]$ScriptDir
     )
 
-    # Resolve absolute paths for robust comparisons
     $scriptFull = (Resolve-Path -LiteralPath $ScriptDir).Path.TrimEnd('\')
     $dirFull    = (Resolve-Path -LiteralPath $Directory).Path.TrimEnd('\')
 
-    # Detect if script is placed at the ROMS root
     $scriptLeaf = (Split-Path -Leaf $scriptFull)
     $scriptIsRomsRoot = ($scriptLeaf -match '^(?i)roms$')
 
-    # If running from ROMS root, platform is first child folder beneath ROMS
     if ($scriptIsRomsRoot) {
         if (-not $dirFull.StartsWith($scriptFull, [System.StringComparison]::OrdinalIgnoreCase)) { return $null }
         $rel = $dirFull.Substring($scriptFull.Length).TrimStart('\')
@@ -417,15 +337,9 @@ function Get-PlatformRootName {
         return $null
     }
 
-    # If running inside a platform folder, the script folder itself is the platform
     return $scriptLeaf.ToLowerInvariant()
 }
 
-# --- FUNCTION: Get-PlatformRootPath ---
-# PURPOSE:
-# - Resolve the platform root path (roms\<platform>) depending on where the script is running.
-# NOTES:
-# - Mirrors Get-PlatformRootName assumptions about “roms root” vs “platform folder”.
 function Get-PlatformRootPath {
     param(
         [Parameter(Mandatory=$true)][string]$ScriptDir,
@@ -436,45 +350,33 @@ function Get-PlatformRootPath {
     $scriptLeaf = (Split-Path -Leaf $scriptFull)
     $scriptIsRomsRoot = ($scriptLeaf -match '^(?i)roms$')
 
-    # If script is at ROMS root, platform path is ROMS\<platform>
     if ($scriptIsRomsRoot) {
         return (Join-Path $scriptFull $PlatformRootName)
     }
 
-    # If script is inside platform folder, platform root is script folder itself
     return $scriptFull
 }
 
-# --- FUNCTION: Get-PlatformCountLabel ---
-# PURPOSE:
-# - Build a human-friendly label for summary counts (platform + subfolder where applicable).
-# NOTES:
-# - Uses uppercase for readability in output.
 function Get-PlatformCountLabel {
     param(
         [Parameter(Mandatory=$true)][string]$Directory,
         [Parameter(Mandatory=$true)][string]$ScriptDir
     )
 
-    # Resolve absolute paths for robust comparisons
     $scriptFull = (Resolve-Path -LiteralPath $ScriptDir).Path.TrimEnd('\')
     $dirFull    = (Resolve-Path -LiteralPath $Directory).Path.TrimEnd('\')
 
-    # If the directory isn't under the script folder, just label with leaf folder
     if (-not $dirFull.StartsWith($scriptFull, [System.StringComparison]::OrdinalIgnoreCase)) {
         return (Split-Path -Leaf $dirFull).ToUpperInvariant()
     }
 
-    # Compute relative path segments beneath script folder
     $scriptLeaf = (Split-Path -Leaf $scriptFull)
     $rel = $dirFull.Substring($scriptFull.Length).TrimStart('\')
     $parts = @()
     if (-not [string]::IsNullOrWhiteSpace($rel)) { $parts = $rel -split '\\' }
 
-    # Determine whether we're running at ROMS root
     $scriptIsRomsRoot = ($scriptLeaf -match '^(?i)roms$')
 
-    # ROMS root mode: first segment is platform; rest is optional subfolders
     if ($scriptIsRomsRoot) {
         if ($parts.Count -eq 0) { return $scriptLeaf.ToUpperInvariant() }
         $platform = $parts[0].ToUpperInvariant()
@@ -483,24 +385,17 @@ function Get-PlatformCountLabel {
         return $platform
     }
 
-    # Platform folder mode: platform is script leaf; include any subfolders beneath it
     $platform = $scriptLeaf.ToUpperInvariant()
     if ($parts.Count -gt 0) { return ($platform + "\" + ($parts -join "\")) }
     return $platform
 }
 
-# --- FUNCTION: Get-RelativeGamelistPath ---
-# PURPOSE:
-# - Convert a ROM full path into the gamelist.xml <path> format: ./subdir/file.ext with / separators.
-# NOTES:
-# - Returns $null if the ROM path is not under the platform root.
 function Get-RelativeGamelistPath {
     param(
         [Parameter(Mandatory=$true)][string]$PlatformRootPath,
         [Parameter(Mandatory=$true)][string]$FileFullPath
     )
 
-    # Resolve both paths; if resolution fails, return $null
     try {
         $rootFull = (Resolve-Path -LiteralPath $PlatformRootPath).Path.TrimEnd('\')
         $fileFull = (Resolve-Path -LiteralPath $FileFullPath).Path
@@ -508,12 +403,10 @@ function Get-RelativeGamelistPath {
         return $null
     }
 
-    # Ensure the file lives under the platform root
     if (-not $fileFull.StartsWith($rootFull, [System.StringComparison]::OrdinalIgnoreCase)) {
         return $null
     }
 
-    # Convert to relative path and normalize separators to forward slashes
     $rel = $fileFull.Substring($rootFull.Length).TrimStart('\')
     if ([string]::IsNullOrWhiteSpace($rel)) { return $null }
 
@@ -521,20 +414,13 @@ function Get-RelativeGamelistPath {
     return ("./" + $rel)
 }
 
-# --- FUNCTION: Get-UniqueGamelistBackupPath ---
-# PURPOSE:
-# - Select a non-colliding backup filename for gamelist.xml (gamelist.backup, gamelist.backup (1), ...).
-# NOTES:
-# - Ensures backups are never overwritten across runs.
 function Get-UniqueGamelistBackupPath {
     param([Parameter(Mandatory=$true)][string]$GamelistPath)
 
-    # Establish base backup filename in same directory as gamelist.xml
     $dir = Split-Path -Parent $GamelistPath
     $base = Join-Path $dir "gamelist.backup"
     if (-not (Test-Path -LiteralPath $base)) { return $base }
 
-    # If base exists, search for the next available (N) suffix
     $i = 1
     while ($true) {
         $p = Join-Path $dir ("gamelist.backup ({0})" -f $i)
@@ -543,27 +429,18 @@ function Get-UniqueGamelistBackupPath {
     }
 }
 
-# --- FUNCTION: Ensure-GamelistLoaded ---
-# PURPOSE:
-# - Load and cache gamelist.xml state (lines + changed flag) per platform.
-# NOTES:
-# - Caches state in $gamelistStateByPlatform to avoid re-reading the file repeatedly.
-# - If file can’t be read, Lines stays $null and Exists stays $true.
 function Ensure-GamelistLoaded {
     param(
         [Parameter(Mandatory=$true)][string]$PlatformRootLower,
         [Parameter(Mandatory=$true)][string]$PlatformRootPath
     )
 
-    # Return cached state if already loaded
     if ($gamelistStateByPlatform.ContainsKey($PlatformRootLower)) {
         return $gamelistStateByPlatform[$PlatformRootLower]
     }
 
-    # Establish gamelist.xml path for this platform
     $gamelistPath = Join-Path $PlatformRootPath "gamelist.xml"
 
-    # Initialize state object
     $state = [PSCustomObject]@{
         RootPath      = $PlatformRootPath
         GamelistPath  = $gamelistPath
@@ -572,7 +449,6 @@ function Ensure-GamelistLoaded {
         Exists        = (Test-Path -LiteralPath $gamelistPath)
     }
 
-    # Attempt to load lines if file exists
     if ($state.Exists) {
         try {
             $state.Lines = [System.IO.File]::ReadAllLines($gamelistPath)
@@ -581,46 +457,28 @@ function Ensure-GamelistLoaded {
         }
     }
 
-    # Cache and return
     $gamelistStateByPlatform[$PlatformRootLower] = $state
     return $state
 }
 
-# --- FUNCTION: Save-GamelistIfChanged ---
-# PURPOSE:
-# - Write gamelist.xml back to disk when it was modified, and create one backup per run per gamelist.
-# NOTES:
-# - Honors $dryRun (no disk writes).
-# - Tracks backups per run via $gamelistBackupDone so only one backup is created per gamelist path.
 function Save-GamelistIfChanged {
     param([Parameter(Mandatory=$true)]$State)
 
-    # Guard: only save if file exists and was changed and has loaded lines
     if (-not $State.Exists -or -not $State.Changed -or $null -eq $State.Lines) { return $false }
 
-    # Dry-run: report only (no writes)
     if ($dryRun) { return $false }
 
-    # Create a single backup per run per gamelist file
     if (-not $gamelistBackupDone.ContainsKey($State.GamelistPath)) {
         $backupPath = Get-UniqueGamelistBackupPath -GamelistPath $State.GamelistPath
         Copy-Item -LiteralPath $State.GamelistPath -Destination $backupPath -Force
         $gamelistBackupDone[$State.GamelistPath] = $true
     }
 
-    # Write back as UTF-8 without BOM, preserving line breaks
     $text = ($State.Lines -join [Environment]::NewLine)
     [System.IO.File]::WriteAllText($State.GamelistPath, $text, [System.Text.UTF8Encoding]::new($false))
     return $true
 }
 
-# --- FUNCTION: Hide-GameEntriesInGamelist ---
-# PURPOSE:
-# - For NON-M3U platforms, locate each target <path> in gamelist.xml and ensure <hidden>true</hidden>.
-# NOTES:
-# - Modifies $State.Lines and sets $State.Changed when edits occur (unless $dryRun).
-# - Adds reporting entries into the ArrayList buckets: newly hidden, already hidden, or missing.
-# - Marks handled files as “used” in $UsedFiles to prevent false “skipped” reports.
 function Hide-GameEntriesInGamelist {
     param(
         [Parameter(Mandatory=$true)]$State,
@@ -628,7 +486,6 @@ function Hide-GameEntriesInGamelist {
         [Parameter(Mandatory=$true)][hashtable]$UsedFiles
     )
 
-    # Establish result counters for this hide operation batch
     $result = [PSCustomObject]@{
         DidWork            = $false
         NewlyHiddenCount   = 0
@@ -636,14 +493,11 @@ function Hide-GameEntriesInGamelist {
         MissingCount       = 0
     }
 
-    # If gamelist doesn't exist (or couldn't load), all targets are missing
     if (-not $State.Exists -or $null -eq $State.Lines) {
 
         foreach ($t in $Targets) {
-            # Track missing lookups for later skip-reason logic
             $noM3UMissingGamelistEntryByFullPath[$t.FullPath] = $true
 
-            # Add to reporting bucket (ArrayList.Add avoids op_Addition errors)
             [void]$noM3UMissingGamelistEntries.Add([PSCustomObject]@{
                 FullPath = $t.FullPath
                 Reason   = "No entry in gamelist.xml (run gamelist update, scrap the game or manually add it into gamelist.xml)"
@@ -655,17 +509,13 @@ function Hide-GameEntriesInGamelist {
         return $result
     }
 
-    # Establish a working copy reference to lines
     $lines = $State.Lines
 
-    # Process each file target that should be hidden
     foreach ($t in $Targets) {
 
-        # Establish the expected <path> value in gamelist.xml (./whatever</path> (capture indentation for insertion)
         $rel = $t.RelPath
         if ([string]::IsNullOrWhiteSpace($rel)) {
 
-            # If we can't compute the rel path, treat as missing in gamelist.xml
             $noM3UMissingGamelistEntryByFullPath[$t.FullPath] = $true
             [void]$noM3UMissingGamelistEntries.Add([PSCustomObject]@{
                 FullPath = $t.FullPath
@@ -675,28 +525,23 @@ function Hide-GameEntriesInGamelist {
             continue
         }
 
-        # Track whether this target was found and whether we applied/confirmed hidden
         $found = $false
         $handled = $false
 
-        # Walk lines looking for a <path> that matches this rel path
         for ($i = 0; $i -lt $lines.Count; $i++) {
 
             $line = $lines[$i]
             if ($null -eq $line) { continue }
 
-            # Match: <path>./whatever</path> (capture indentation for insertion)
             $m = [regex]::Match($line, '^(?<I>\s*)<path>\s*(?<V>.*?)\s*</path>\s*$')
             if (-not $m.Success) { continue }
 
             $val = $m.Groups['V'].Value
             if ($val -ne $rel) { continue }
 
-            # Found matching <path> entry
             $found = $true
             $indent = $m.Groups['I'].Value
 
-            # Scan forward within this <game> block for an existing <hidden> node
             $j = $i + 1
             $hiddenLineIndex = $null
             $hiddenValue = $null
@@ -704,11 +549,9 @@ function Hide-GameEntriesInGamelist {
             while ($j -lt $lines.Count) {
                 $tline = $lines[$j]
 
-                # Stop if next game path begins or game ends
                 if ($tline -match '^\s*<path>\s*') { break }
                 if ($tline -match '^\s*</game>\s*$') { break }
 
-                # Match: <hidden>...</hidden>
                 $hm = [regex]::Match($tline, '^\s*<hidden>\s*(?<H>.*?)\s*</hidden>\s*$')
                 if ($hm.Success) {
                     $hiddenLineIndex = $j
@@ -718,10 +561,8 @@ function Hide-GameEntriesInGamelist {
                 $j++
             }
 
-            # Case 1: <hidden> exists already
             if ($null -ne $hiddenLineIndex) {
 
-                # Subcase: already hidden => count/report, mark used
                 if ($hiddenValue -match '^(?i)true$') {
                     $UsedFiles[$t.FullPath] = $true
                     [void]$noM3UAlreadyHidden.Add([PSCustomObject]@{
@@ -731,7 +572,6 @@ function Hide-GameEntriesInGamelist {
                     $result.AlreadyHiddenCount++
                     $handled = $true
                 }
-                # Subcase: hidden exists but not true => flip to true, mark changed (unless dryrun)
                 else {
                     if (-not $dryRun) {
                         $lines[$hiddenLineIndex] = ($lines[$hiddenLineIndex] -replace '(?i)<hidden>\s*.*?\s*</hidden>', '<hidden>true</hidden>')
@@ -747,15 +587,12 @@ function Hide-GameEntriesInGamelist {
                     $handled = $true
                 }
             }
-            # Case 2: <hidden> does not exist => insert a new <hidden>true</hidden> line after <path>
             else {
 
                 if (-not $dryRun) {
 
-                    # Build the inserted line at the same indentation level as <path>
                     $insertLine = ($indent + "<hidden>true</hidden>")
 
-                    # Splice-in: lines[0..i] + insertLine + lines[i+1..end]
                     $before = @()
                     if ($i -ge 0) { $before = $lines[0..$i] }
                     $after = @()
@@ -764,7 +601,6 @@ function Hide-GameEntriesInGamelist {
                     $lines = @($before + $insertLine + $after)
                 }
 
-                # Mark state changed and report this as a newly hidden entry
                 $State.Changed = $true
                 $result.DidWork = $true
                 $result.NewlyHiddenCount++
@@ -775,16 +611,12 @@ function Hide-GameEntriesInGamelist {
                 })
 
                 $handled = $true
-
-                # Advance index so we don't re-process inserted line in this loop
                 $i++
             }
 
-            # Once handled (hidden confirmed or applied), stop scanning for this target
             if ($handled) { break }
         }
 
-        # If we never found a matching <path> entry, mark as missing
         if (-not $found) {
             $noM3UMissingGamelistEntryByFullPath[$t.FullPath] = $true
             [void]$noM3UMissingGamelistEntries.Add([PSCustomObject]@{
@@ -795,34 +627,153 @@ function Hide-GameEntriesInGamelist {
         }
     }
 
-    # Persist the potentially re-built array back into state (important when we spliced lines)
     $State.Lines = $lines
     return $result
 }
 
-# --- FUNCTION: Parse-GameFile ---
-# PURPOSE:
-# - Parse a filename into multi-disk metadata (disk/side/total/tags) used for grouping and selection.
-# NOTES:
-# - Returns $null for files that do not look like multi-disk candidates.
-# - Supports Disk/Disc + numeric/letter/roman tokens, optional “of N”, and Side markers.
-# - Side-only patterns are treated as Disk 1 with Side A/B/etc.
+function Unhide-GameEntriesInGamelist {
+    param(
+        [Parameter(Mandatory=$true)]$State,
+        [Parameter(Mandatory=$true)]$Targets,
+        [Parameter(Mandatory=$true)][hashtable]$UsedFiles
+    )
+
+    $result = [PSCustomObject]@{
+        DidWork             = $false
+        NewlyUnhiddenCount  = 0
+        AlreadyVisibleCount = 0
+        MissingCount        = 0
+    }
+
+    if (-not $State.Exists -or $null -eq $State.Lines) {
+
+        foreach ($t in $Targets) {
+            $noM3UMissingGamelistEntryByFullPath[$t.FullPath] = $true
+            [void]$noM3UMissingGamelistEntries.Add([PSCustomObject]@{
+                FullPath = $t.FullPath
+                Reason   = "No entry in gamelist.xml (run gamelist update, scrap the game or manually add it into gamelist.xml)"
+            })
+            $result.MissingCount++
+        }
+
+        return $result
+    }
+
+    $lines = $State.Lines
+
+    foreach ($t in $Targets) {
+
+        $rel = $t.RelPath
+        if ([string]::IsNullOrWhiteSpace($rel)) {
+
+            $noM3UMissingGamelistEntryByFullPath[$t.FullPath] = $true
+            [void]$noM3UMissingGamelistEntries.Add([PSCustomObject]@{
+                FullPath = $t.FullPath
+                Reason   = "No entry in gamelist.xml (run gamelist update, scrap the game or manually add it into gamelist.xml)"
+            })
+            $result.MissingCount++
+            continue
+        }
+
+        $found = $false
+        $handled = $false
+
+        for ($i = 0; $i -lt $lines.Count; $i++) {
+
+            $line = $lines[$i]
+            if ($null -eq $line) { continue }
+
+            $m = [regex]::Match($line, '^(?<I>\s*)<path>\s*(?<V>.*?)\s*</path>\s*$')
+            if (-not $m.Success) { continue }
+
+            $val = $m.Groups['V'].Value
+            if ($val -ne $rel) { continue }
+
+            $found = $true
+
+            $j = $i + 1
+            $hiddenLineIndex = $null
+            $hiddenValue = $null
+
+            while ($j -lt $lines.Count) {
+                $tline = $lines[$j]
+
+                if ($tline -match '^\s*<path>\s*') { break }
+                if ($tline -match '^\s*</game>\s*$') { break }
+
+                $hm = [regex]::Match($tline, '^\s*<hidden>\s*(?<H>.*?)\s*</hidden>\s*$')
+                if ($hm.Success) {
+                    $hiddenLineIndex = $j
+                    $hiddenValue = $hm.Groups['H'].Value
+                    break
+                }
+
+                $j++
+            }
+
+            if ($null -ne $hiddenLineIndex -and $hiddenValue -match '^(?i)true$') {
+
+                if (-not $dryRun) {
+                    $before = @()
+                    if ($hiddenLineIndex -gt 0) { $before = $lines[0..($hiddenLineIndex - 1)] }
+                    $after = @()
+                    if (($hiddenLineIndex + 1) -le ($lines.Count - 1)) { $after = $lines[($hiddenLineIndex + 1)..($lines.Count - 1)] }
+
+                    $lines = @($before + $after)
+                }
+
+                $State.Changed = $true
+                $result.DidWork = $true
+                $result.NewlyUnhiddenCount++
+                $UsedFiles[$t.FullPath] = $true
+
+                [void]$noM3UNewlyUnhidden.Add([PSCustomObject]@{
+                    FullPath = $t.FullPath
+                    Reason   = "Unhidden in gamelist.xml"
+                })
+
+                $handled = $true
+                break
+            }
+            else {
+
+                $UsedFiles[$t.FullPath] = $true
+                [void]$noM3UAlreadyVisible.Add([PSCustomObject]@{
+                    FullPath = $t.FullPath
+                    Reason   = "Already visible in gamelist.xml"
+                })
+                $result.AlreadyVisibleCount++
+                $handled = $true
+                break
+            }
+        }
+
+        if (-not $found) {
+            $noM3UMissingGamelistEntryByFullPath[$t.FullPath] = $true
+            [void]$noM3UMissingGamelistEntries.Add([PSCustomObject]@{
+                FullPath = $t.FullPath
+                Reason   = "No entry in gamelist.xml (run gamelist update, scrap the game or manually add it into gamelist.xml)"
+            })
+            $result.MissingCount++
+        }
+    }
+
+    $State.Lines = $lines
+    return $result
+}
+
 function Parse-GameFile {
     param(
         [Parameter(Mandatory=$true)][string]$FileName,
         [Parameter(Mandatory=$true)][string]$Directory
     )
 
-    # Strip extension for token parsing
     $nameNoExt = $FileName -replace '\.[^\.]+$', ''
 
-    # Disk/Disc pattern with optional: "of N" and "Side X"
     $diskPattern = '(?i)^(?<Prefix>.*?)(?<Sep>[\s._\-\(]|^)(?<Type>disk|disc)(?!s)[\s_]*(?<Disk>\d+|[A-Za-z]|(?:I|II|III|IV|V|VI|VII|VIII|IX|X|XI|XII|XIII|XIV|XV|XVI|XVII|XVIII|XIX|XX))(?:(?=\s+of\s+\d+)|(?=\s+Side\s+[A-Za-z])|(?=[\s\)\]\._-]|$))(?:\s+of\s+(?<Total>\d+))?(?:\s+Side\s+(?<Side>[A-Za-z]))?(?<After>.*)$'
 
-    # Side-only pattern (Side A/B/etc.), treated as Disk 1 with differing sides
     $sideOnlyPattern = '(?i)^(?<Prefix>.*?)(?<Sep>[\s._\-\(]|^)Side\s+(?<SideOnly>[A-Za-z])(?=[\s\)\]\._-]|$)(?<After>.*)$'
 
-    # Attempt disk match first
     $diskMatch = [regex]::Match($nameNoExt, $diskPattern)
     $sideOnlyMatch = $null
 
@@ -831,19 +782,16 @@ function Parse-GameFile {
         $sideOnlyMatch = [regex]::Match($nameNoExt, $sideOnlyPattern)
     }
 
-    # If neither matches, file isn't a multi-disk candidate
     if (-not $hasDisk -and (-not $sideOnlyMatch.Success)) {
         return $null
     }
 
-    # Initialize parsed fields
     $prefixRaw  = ""
     $diskToken  = $null
     $totalToken = $null
     $sideToken  = $null
     $after      = ""
 
-    # Populate fields based on which pattern matched
     if ($hasDisk) {
         $prefixRaw = $diskMatch.Groups['Prefix'].Value
         $diskToken = $diskMatch.Groups['Disk'].Value
@@ -858,13 +806,9 @@ function Parse-GameFile {
         $after      = $sideOnlyMatch.Groups['After'].Value
     }
 
-    # Normalize base prefix (for grouping + naming)
     $basePrefix = Clean-BasePrefix $prefixRaw
-
-    # Normalize the remainder (strip leading ')' and whitespace artifacts)
     $afterNorm = $after -replace '^[\)\s]+', ''
 
-    # Extract name hint (single leading parenthetical right after the designator), if present
     $nameHint = ""
     $beforeBracket = $afterNorm
     $bracketIdx = $beforeBracket.IndexOf('[')
@@ -872,7 +816,6 @@ function Parse-GameFile {
     $mHint = [regex]::Match($beforeBracket, '^\s*(\([^\)]+\))')
     if ($mHint.Success) { $nameHint = $mHint.Groups[1].Value }
 
-    # Gather bracket tags (excluding disk-noise tags and extension-mirroring tags)
     $bracketTags = @()
     foreach ($m in [regex]::Matches($afterNorm, '\[[^\]]+\]')) {
         $tag = $m.Value
@@ -881,7 +824,6 @@ function Parse-GameFile {
         $bracketTags += $tag
     }
 
-    # Split tags into alt tag (single) and base tags (remaining)
     $altTag  = ""
     $baseTags = @()
     foreach ($t in $bracketTags) {
@@ -889,18 +831,14 @@ function Parse-GameFile {
         else { $baseTags += $t }
     }
 
-    # Create stable keys for grouping
     $baseTagsKey = ($baseTags -join "")
 
-    # Convert tokens to sortable values
     $diskSort = Convert-DiskToSort $diskToken
     $sideSort = Convert-SideToSort $sideToken
 
-    # Parse total disks if present
     $totalDisks = $null
     if ($totalToken -match '^\d+$') { $totalDisks = [int]$totalToken }
 
-    # Return parsed metadata object
     return [PSCustomObject]@{
         FileName        = $FileName
         Directory       = $Directory
@@ -917,11 +855,6 @@ function Parse-GameFile {
     }
 }
 
-# --- FUNCTION: Select-DiskEntries ---
-# PURPOSE:
-# - Select candidate entries for a specific disk number within a set (optionally constrained by alt and total).
-# NOTES:
-# - Sorts matches by SideSort so Side A comes before Side B for the same disk.
 function Select-DiskEntries {
     param(
         [Parameter(Mandatory=$true)]$Files,
@@ -933,10 +866,8 @@ function Select-DiskEntries {
         [Parameter(Mandatory=$false)]$RootTotal
     )
 
-    # Normalize requested alt so "" and $null compare consistently
     $wantAlt = Normalize-Alt $AltTag
 
-    # Filter by disk number, alt, and (optionally) total disk count consistency
     $picked = @(
         $Files | Where-Object {
             $_.DiskSort -eq $DiskNumber -and
@@ -952,35 +883,25 @@ function Select-DiskEntries {
 # PHASE 1: FILE ENUMERATION / PARSING
 # ==================================================================================================
 
-# Establish collection for parsed candidates
 $parsed = @()
 
-# Announce scan phase (Get-ChildItem -Recurse is commonly the longest wait)
 Write-Phase "Collecting ROM file data (scanning folders, which might take a while)..."
 
-# Enumerate files under scriptDir (up to 2 subdirectory levels)
 Get-ChildItem -Path $scriptDir -File -Recurse -Depth 2 | ForEach-Object {
 
-    # Skip M3U input files (avoid treating playlists as ROM inputs)
     if ($_.Extension -ieq ".m3u") { return }
-
-    # Skip known media/manual folders to reduce false positives
     if ($skipFolders -contains $_.Directory.Name.ToLowerInvariant()) { return }
 
-    # If user wants to skip non-M3U platforms entirely, filter them out during enumeration
     if ($noM3UPlatformMode -ieq "skip") {
 
-        # Determine platform folder for this file
         $plat = Get-PlatformRootName -Directory $_.DirectoryName -ScriptDir $scriptDir
         if ($null -ne $plat) {
 
-            # Normalize configured non-M3U platform list to lowercase for consistent comparisons
             $noM3USetLower = @($nonM3UPlatforms | ForEach-Object { $_.ToLowerInvariant() })
             if ($noM3USetLower -contains $plat.ToLowerInvariant()) { return }
         }
     }
 
-    # Attempt to parse this file as a multi-disk candidate
     $p = Parse-GameFile -FileName $_.Name -Directory $_.DirectoryName
     if ($null -ne $p) { $parsed += $p }
 }
@@ -989,33 +910,26 @@ Get-ChildItem -Path $scriptDir -File -Recurse -Depth 2 | ForEach-Object {
 # PHASE 2: INDEXING / GROUPING
 # ==================================================================================================
 
-# Announce indexing phase
 Write-Phase "Indexing parsed candidates (grouping titles, tags, variants, etc.)..."
 
-# Group strictly by directory + base title prefix + full base tags key (excluding alt tags)
 $groupsStrict = $parsed | Group-Object Directory, BasePrefix, BaseTagsKey
 
-# Build a title index: TitleKey -> list of parsed entries (used for relaxed matching)
 $titleIndex = @{}
 foreach ($p in $parsed) {
     if (-not $titleIndex.ContainsKey($p.TitleKey)) { $titleIndex[$p.TitleKey] = @() }
     $titleIndex[$p.TitleKey] += $p
 }
 
-# Track "bang" ([!]) presence per title + non-bang tags, and per title + non-bang tags + alt
 $bangByTitleNB = @{}
 $bangAltByTitleNB = @{}
 
 foreach ($p in $parsed) {
 
-    # Only record if [!] exists in this entry's base tags key
     if ($p.BaseTagsKey -match '\[\!\]') {
 
-        # TitleKey + NonBangKey indicates at least one [!] variant exists for that title+tag family
         $k = $p.TitleKey + "`0" + $p.BaseTagsKeyNB
         $bangByTitleNB[$k] = $true
 
-        # Also track alt-specific [!] existence (used for suppression rules)
         if (-not [string]::IsNullOrWhiteSpace($p.AltTag)) {
             $k2 = $p.TitleKey + "`0" + $p.BaseTagsKeyNB + "`0" + $p.AltTag
             $bangAltByTitleNB[$k2] = $true
@@ -1023,81 +937,60 @@ foreach ($p in $parsed) {
     }
 }
 
-# Track playlist paths claimed in this run (prevents collisions)
 $occupiedPlaylistPaths = @{}
-
-# Track which playlists were actually written in this run (M3U-only)
 $m3uWrittenPlaylistPaths = @{}
-
-# Track duplicate-content signatures to suppress identical playlists in the same run
 $playlistSignatures = @{}
 
-# Track suppression buckets for reporting
 $suppressedDuplicatePlaylists   = @{} # playlistPath -> collidedWithPath
 $suppressedPreExistingPlaylists = @{} # playlistPath -> $true (content identical)
 $overwrittenExistingPlaylists   = @{} # playlistPath -> $true (content differed)
 
-# Track which disk files were used by either written/suppressed playlists or successful gamelist hides
 $usedFiles = @{}
 
 # ==================================================================================================
 # PHASE 3: PROCESS MULTI-DISK GROUPS (M3U PLAYLISTS + NON-M3U GAMELIST HIDING)
 # ==================================================================================================
 
-# Announce processing phase
 Write-Phase "Processing multi-disk candidates (playlists / gamelist updates)..."
 
 foreach ($group in $groupsStrict) {
 
-    # Establish group context values (shared by all members)
     $groupFiles = $group.Group
     $directory  = $groupFiles[0].Directory
     $basePrefix = $groupFiles[0].BasePrefix
     $titleKey   = $groupFiles[0].TitleKey
 
-    # Establish relaxed candidate list for this title (same title prefix across tags)
     $titleFiles = if ($titleIndex.ContainsKey($titleKey)) { $titleIndex[$titleKey] } else { $groupFiles }
-
-    # Establish non-bang tags key for relaxed matching
     $strictNBKey = $groupFiles[0].BaseTagsKeyNB
 
-    # Filter to title-compatible entries that match non-bang tags key
     $titleCompatible = @(
         $titleFiles | Where-Object { $_.BaseTagsKeyNB -eq $strictNBKey }
     )
 
-    # Establish all alt keys present in this strict group ("" included for base)
     $altKeys = @(
         ($groupFiles | Select-Object -ExpandProperty AltTag | ForEach-Object { if ($_ -eq $null) { "" } else { $_ } } | Sort-Object -Unique)
     )
 
     foreach ($altKey in $altKeys) {
 
-        # Disk 1 roots help determine "total disk count" variants
         $disk1Roots = @($titleCompatible | Where-Object { $_.DiskSort -eq 1 })
 
-        # Gather explicit totals (Disk 1 "of N") values; fallback to $null if none
         $totals = @($disk1Roots | Where-Object { $_.TotalDisks -ne $null } | Select-Object -ExpandProperty TotalDisks | Sort-Object -Unique)
         if ($totals.Count -eq 0) { $totals = @($null) }
 
         foreach ($rootTotal in $totals) {
 
-            # Determine which disk numbers we are targeting for this set
             $diskTargets = if ($rootTotal) { 1..$rootTotal }
                            else { @($titleCompatible | Select-Object -ExpandProperty DiskSort | Sort-Object -Unique) }
 
-            # Accumulate selected files for the playlist (or non-M3U set)
             $playlistFiles = @()
 
             foreach ($d in $diskTargets) {
 
-                # Establish selection list for this disk number
                 $picked = @()
 
-                # Pass 1: strict match within the strict group (same dir + base tags + alt)
                 $picked = Select-DiskEntries -Files $groupFiles -DiskNumber $d -AltTag $altKey -RootTotal $rootTotal
 
-                # Pass 1.5: if base playlist and strict missing, allow a single unambiguous alt disk
                 if ($picked.Count -eq 0 -and [string]::IsNullOrWhiteSpace($altKey)) {
 
                     $candAlt = @(
@@ -1111,7 +1004,6 @@ foreach ($group in $groupsStrict) {
                     if ($candAlt.Count -eq 1) { $picked = $candAlt }
                 }
 
-                # Pass 2: relaxed match within the title-compatible family (same title + non-bang tags)
                 if ($picked.Count -eq 0) {
 
                     $wantAlt = Normalize-Alt $altKey
@@ -1126,7 +1018,6 @@ foreach ($group in $groupsStrict) {
                     if ($cand.Count -gt 0) { $picked = $cand }
                 }
 
-                # Pass 3: strict alt fallback chain within the strict group
                 if ($picked.Count -eq 0) {
                     $altChain = Get-AltFallbackChain $altKey
                     foreach ($tryAlt in $altChain) {
@@ -1135,7 +1026,6 @@ foreach ($group in $groupsStrict) {
                     }
                 }
 
-                # Pass 4: relaxed alt fallback chain within the title-compatible family
                 if ($picked.Count -eq 0) {
                     $altChain = Get-AltFallbackChain $altKey
                     foreach ($tryAlt in $altChain) {
@@ -1153,23 +1043,18 @@ foreach ($group in $groupsStrict) {
                     }
                 }
 
-                # If anything was picked for this disk number, add to set
                 if ($picked.Count -gt 0) { $playlistFiles += $picked }
             }
 
-            # Guard: require at least 2 entries to be considered a multi-disk set
             if (@($playlistFiles).Count -lt 2) { continue }
 
-            # Determine whether a single shared name hint exists among all selected entries
             $uniqueHints = @($playlistFiles | Select-Object -ExpandProperty NameHint | Sort-Object -Unique)
             $useHint = ""
             if ($uniqueHints.Count -eq 1 -and (-not [string]::IsNullOrWhiteSpace($uniqueHints[0]))) { $useHint = $uniqueHints[0] }
 
-            # Build base playlist name: base title prefix + (optional) shared hint
             $playlistBase = $basePrefix
             if ($useHint) { $playlistBase += $useHint }
 
-            # Add only those base tags that are common across all selected entries
             $commonBaseTags = @()
             if (@($playlistFiles).Count -gt 0) {
                 $firstTags = @($playlistFiles[0].BaseTags)
@@ -1183,23 +1068,19 @@ foreach ($group in $groupsStrict) {
             }
             if ($commonBaseTags.Count -gt 0) { $playlistBase += ($commonBaseTags -join "") }
 
-            # If all entries share the same alt, append it
             $altsInPlaylist = @($playlistFiles | ForEach-Object { Normalize-Alt $_.AltTag } | Sort-Object -Unique)
             if ($altsInPlaylist.Count -eq 1 -and $altsInPlaylist[0]) {
                 $playlistBase += $altsInPlaylist[0]
             }
 
-            # Final cleanup of the playlist base name
             $playlistBase = $playlistBase -replace '\s{2,}', ' '
             $playlistBase = $playlistBase -replace '[\s._-]*[\(]*$', ''
             $playlistBase = $playlistBase -replace '\(\s*\)', ''
             $playlistBase = $playlistBase.Trim()
             if ([string]::IsNullOrWhiteSpace($playlistBase)) { continue }
 
-            # Determine the platform root for this directory
             $platformRoot = Get-PlatformRootName -Directory $directory -ScriptDir $scriptDir
 
-            # Determine whether this is a NON-M3U platform
             $isNoM3U = $false
             if ($null -ne $platformRoot) {
                 $rootLower = $platformRoot.ToLowerInvariant()
@@ -1207,13 +1088,53 @@ foreach ($group in $groupsStrict) {
                 $isNoM3U = ($noM3USetLower -contains $rootLower)
             }
 
-            # If NON-M3U and mode is skip, do nothing
             if ($isNoM3U -and $noM3UPlatformMode -ieq "skip") { continue }
 
-            # Sort selected files by disk number then side
             $sorted = $playlistFiles | Sort-Object DiskSort, SideSort
 
-            # Determine whether the set is incomplete (only enforce when rootTotal is known)
+            if ($isNoM3U) {
+
+                $disk1Candidates = @($sorted | Where-Object { $_.DiskSort -eq 1 } | Sort-Object SideSort)
+                $hasDisk1 = ($disk1Candidates.Count -gt 0)
+
+                if (-not $hasDisk1) {
+
+                    $platformLower = $platformRoot.ToLowerInvariant()
+                    $rootPath = Get-PlatformRootPath -ScriptDir $scriptDir -PlatformRootName $platformLower
+                    $state = Ensure-GamelistLoaded -PlatformRootLower $platformLower -PlatformRootPath $rootPath
+
+                    $targetsU = @()
+                    foreach ($sf in $sorted) {
+                        $fullFile = Join-Path $sf.Directory $sf.FileName
+                        $rel = Get-RelativeGamelistPath -PlatformRootPath $rootPath -FileFullPath $fullFile
+                        $targetsU += [PSCustomObject]@{
+                            FullPath      = $fullFile
+                            RelPath       = $rel
+                            PlatformLabel = $platformRoot.ToUpperInvariant()
+                        }
+                    }
+
+                    $unhideResult = Unhide-GameEntriesInGamelist -State $state -Targets $targetsU -UsedFiles $usedFiles
+
+                    $platLabel = $platformRoot.ToUpperInvariant()
+                    if (-not $gamelistUnhiddenCounts.ContainsKey($platLabel)) { $gamelistUnhiddenCounts[$platLabel] = 0 }
+                    if (-not $gamelistAlreadyVisibleCounts.ContainsKey($platLabel)) { $gamelistAlreadyVisibleCounts[$platLabel] = 0 }
+                    $gamelistUnhiddenCounts[$platLabel] += [int]$unhideResult.NewlyUnhiddenCount
+                    $gamelistAlreadyVisibleCounts[$platLabel] += [int]$unhideResult.AlreadyVisibleCount
+
+                    foreach ($sf in $sorted) {
+                        $full = Join-Path $sf.Directory $sf.FileName
+                        [void]$noM3UNoDisk1Sets.Add([PSCustomObject]@{
+                            FullPath = $full
+                            Reason   = "Disk 1 not detected; set treated as incomplete"
+                        })
+                        $usedFiles[$full] = $true
+                    }
+
+                    continue
+                }
+            }
+
             $setIsIncomplete = $false
             if ($rootTotal) {
                 $presentDisks = @($playlistFiles | Select-Object -ExpandProperty DiskSort | Sort-Object -Unique)
@@ -1224,8 +1145,6 @@ foreach ($group in $groupsStrict) {
                 if ($missingDisksLocal.Count -gt 0) { $setIsIncomplete = $true }
             }
 
-            # Apply [!] preference suppression rule:
-            # If this strict group does not have [!], but there exists a [!] variant for the same title+nonbang+alt, suppress
             $thisHasBang = ($groupFiles[0].BaseTagsKey -match '\[\!\]')
             $wantAltNorm = Normalize-Alt $altKey
             if (-not $thisHasBang -and $wantAltNorm) {
@@ -1236,10 +1155,6 @@ foreach ($group in $groupsStrict) {
                 }
             }
 
-            # Build M3U content (filenames only), then sanitize:
-            # - Trim end spaces
-            # - Remove blank lines
-            # - No trailing newline at EOF (WriteAllText with cleanText as-is)
             $newLines = @($sorted | ForEach-Object { $_.FileName })
             $cleanLines = @(
                 $newLines |
@@ -1250,16 +1165,12 @@ foreach ($group in $groupsStrict) {
             $cleanText = ($cleanLines -join "`n")
             $newNorm   = Normalize-M3UText $cleanText
 
-            # Compute playlist path:
-            # - NON-M3U: path without extension is used as an internal "claimed" key only
-            # - M3U: actual .m3u file path
             $playlistPath = if ($isNoM3U) {
                 Join-Path $directory "$playlistBase"
             } else {
                 Join-Path $directory "$playlistBase.m3u"
             }
 
-            # Collision avoidance: if this path was already claimed during this run, generate [alt] variants
             if ($occupiedPlaylistPaths.ContainsKey($playlistPath)) {
                 $altIndex = 1
                 do {
@@ -1273,19 +1184,15 @@ foreach ($group in $groupsStrict) {
                 } while ($occupiedPlaylistPaths.ContainsKey($playlistPath))
             }
 
-            # Build signature for duplicate-content suppression during the same run
             $sigParts = @()
             foreach ($sf in $sorted) { $sigParts += (Join-Path $sf.Directory $sf.FileName) }
             $playlistSig = ($sigParts -join "`0")
 
-            # Suppress identical content duplicates in the same run
             if ($playlistSignatures.ContainsKey($playlistSig)) {
 
-                # Record suppression reason
                 $suppressedDuplicatePlaylists[$playlistPath] = $playlistSignatures[$playlistSig]
                 $occupiedPlaylistPaths[$playlistPath] = $true
 
-                # Mark all these files as used (so they don't appear as skipped)
                 foreach ($sf in $sorted) {
                     $full = Join-Path $sf.Directory $sf.FileName
                     $usedFiles[$full] = $true
@@ -1294,13 +1201,11 @@ foreach ($group in $groupsStrict) {
                 continue
             }
 
-            # For M3U output, suppress overwrites if the existing file content is identical (after BOM/newline normalization)
             if (-not $isNoM3U) {
 
                 $existsOnDisk = Test-Path -LiteralPath $playlistPath
                 if ($existsOnDisk) {
 
-                    # Read existing playlist text
                     $existingRaw = $null
                     try {
                         $existingRaw = Get-Content -LiteralPath $playlistPath -Raw -ErrorAction Stop
@@ -1308,10 +1213,8 @@ foreach ($group in $groupsStrict) {
                         $existingRaw = $null
                     }
 
-                    # Normalize for equality comparison
                     $existingNorm = Normalize-M3UText $existingRaw
 
-                    # Compare line-by-line
                     $sameContent = ($existingNorm.Count -eq $newNorm.Count)
                     if ($sameContent) {
                         for ($i = 0; $i -lt $existingNorm.Count; $i++) {
@@ -1319,13 +1222,11 @@ foreach ($group in $groupsStrict) {
                         }
                     }
 
-                    # If identical, suppress write
                     if ($sameContent) {
                         $suppressedPreExistingPlaylists[$playlistPath] = $true
                         $occupiedPlaylistPaths[$playlistPath] = $true
                         $playlistSignatures[$playlistSig] = $playlistPath
 
-                        # Mark these files as used
                         foreach ($sf in $sorted) {
                             $full = Join-Path $sf.Directory $sf.FileName
                             $usedFiles[$full] = $true
@@ -1334,37 +1235,68 @@ foreach ($group in $groupsStrict) {
                         continue
                     }
 
-                    # Otherwise: file exists and differs => we'll overwrite it
                     $overwrittenExistingPlaylists[$playlistPath] = $true
                 }
             }
 
-            # Record this signature as emitted (written or processed)
             $playlistSignatures[$playlistSig] = $playlistPath
             $occupiedPlaylistPaths[$playlistPath] = $true
 
-            # --------------------------------------------------------------------------------------------------
-            # BRANCH: NON-M3U PLATFORMS => GAMELIST HIDING
-            # --------------------------------------------------------------------------------------------------
             if ($isNoM3U) {
 
-                # Establish primary entry to keep visible: the first file in sorted set
-                $primaryFull = Join-Path $sorted[0].Directory $sorted[0].FileName
+                $disk1Candidates = @($sorted | Where-Object { $_.DiskSort -eq 1 } | Sort-Object SideSort)
+                if ($disk1Candidates.Count -eq 0) { continue }
+
+                $primaryObj  = $disk1Candidates[0]
+                $primaryFull = Join-Path $primaryObj.Directory $primaryObj.FileName
                 $usedFiles[$primaryFull] = $true
 
-                # If the set is incomplete, do not hide anything; keep visible and annotate
                 if ($setIsIncomplete) {
+
+                    $platformLower = $platformRoot.ToLowerInvariant()
+                    $rootPath = Get-PlatformRootPath -ScriptDir $scriptDir -PlatformRootName $platformLower
+                    $state = Ensure-GamelistLoaded -PlatformRootLower $platformLower -PlatformRootPath $rootPath
+
+                    $toUnhideObjs = @($sorted | Where-Object { (Join-Path $_.Directory $_.FileName) -ne $primaryFull })
+                    if ($toUnhideObjs.Count -gt 0) {
+
+                        $targetsU = @()
+                        foreach ($sf in $toUnhideObjs) {
+                            $fullFile = Join-Path $sf.Directory $sf.FileName
+                            $rel = Get-RelativeGamelistPath -PlatformRootPath $rootPath -FileFullPath $fullFile
+                            $targetsU += [PSCustomObject]@{
+                                FullPath      = $fullFile
+                                RelPath       = $rel
+                                PlatformLabel = $platformRoot.ToUpperInvariant()
+                            }
+                        }
+
+                        $unhideResult = Unhide-GameEntriesInGamelist -State $state -Targets $targetsU -UsedFiles $usedFiles
+
+                        $platLabel = $platformRoot.ToUpperInvariant()
+                        if (-not $gamelistUnhiddenCounts.ContainsKey($platLabel)) { $gamelistUnhiddenCounts[$platLabel] = 0 }
+                        if (-not $gamelistAlreadyVisibleCounts.ContainsKey($platLabel)) { $gamelistAlreadyVisibleCounts[$platLabel] = 0 }
+                        $gamelistUnhiddenCounts[$platLabel] += [int]$unhideResult.NewlyUnhiddenCount
+                        $gamelistAlreadyVisibleCounts[$platLabel] += [int]$unhideResult.AlreadyVisibleCount
+
+                        foreach ($sf in $toUnhideObjs) {
+                            $full = Join-Path $sf.Directory $sf.FileName
+                            $usedFiles[$full] = $true
+                        }
+                    }
+
                     [void]$noM3UPrimaryEntriesIncomplete.Add([PSCustomObject]@{
                         FullPath = $primaryFull
                         Reason   = "Primary entry kept visible (disk set incomplete)"
                     })
+
                     continue
                 }
 
-                # Determine entries to hide (Disk 2+ equivalents)
-                $toHide = @($sorted | Select-Object -Skip 1)
+                $toHide = @(
+                    $sorted | Where-Object { (Join-Path $_.Directory $_.FileName) -ne $primaryFull }
+                )
 
-                # If there's nothing to hide, record primary and move on
                 if ($toHide.Count -eq 0) {
                     [void]$noM3UPrimaryEntriesOk.Add([PSCustomObject]@{
                         FullPath = $primaryFull
@@ -1373,12 +1305,10 @@ foreach ($group in $groupsStrict) {
                     continue
                 }
 
-                # Compute platform root + load gamelist state (cached)
                 $platformLower = $platformRoot.ToLowerInvariant()
                 $rootPath = Get-PlatformRootPath -ScriptDir $scriptDir -PlatformRootName $platformLower
                 $state = Ensure-GamelistLoaded -PlatformRootLower $platformLower -PlatformRootPath $rootPath
 
-                # Build hide targets with relative gamelist paths
                 $targets = @()
                 foreach ($sf in $toHide) {
 
@@ -1393,17 +1323,14 @@ foreach ($group in $groupsStrict) {
                     }
                 }
 
-                # Perform hide operations and get result counts
                 $hideResult = Hide-GameEntriesInGamelist -State $state -Targets $targets -UsedFiles $usedFiles
 
-                # Accumulate per-platform counts for summary reporting
                 $platLabel = $platformRoot.ToUpperInvariant()
                 if (-not $gamelistHiddenCounts.ContainsKey($platLabel)) { $gamelistHiddenCounts[$platLabel] = 0 }
                 if (-not $gamelistAlreadyHiddenCounts.ContainsKey($platLabel)) { $gamelistAlreadyHiddenCounts[$platLabel] = 0 }
                 $gamelistHiddenCounts[$platLabel] += [int]$hideResult.NewlyHiddenCount
                 $gamelistAlreadyHiddenCounts[$platLabel] += [int]$hideResult.AlreadyHiddenCount
 
-                # Record the primary entry and annotate if some entries were missing from gamelist.xml
                 if ($hideResult.MissingCount -gt 0) {
                     [void]$noM3UPrimaryEntriesOk.Add([PSCustomObject]@{
                         FullPath = $primaryFull
@@ -1416,7 +1343,6 @@ foreach ($group in $groupsStrict) {
                     })
                 }
 
-                # Count NON-M3U “set handled” as a “playlist created” in the summary counters
                 $platformLabel = $platformRoot.ToUpperInvariant()
                 if (-not $platformCounts.ContainsKey($platformLabel)) { $platformCounts[$platformLabel] = 0 }
                 $platformCounts[$platformLabel]++
@@ -1425,28 +1351,19 @@ foreach ($group in $groupsStrict) {
                 continue
             }
 
-            # --------------------------------------------------------------------------------------------------
-            # BRANCH: M3U PLATFORMS => WRITE PLAYLISTS
-            # --------------------------------------------------------------------------------------------------
-
-            # If set is incomplete, do not write an M3U playlist
             if ($setIsIncomplete) { continue }
 
-            # Write M3U playlist file unless in dry-run mode
             if (-not $dryRun) {
                 [System.IO.File]::WriteAllText($playlistPath, $cleanText, [System.Text.UTF8Encoding]::new($false))
             }
 
-            # Track that this playlist was written (M3U only)
             $m3uWrittenPlaylistPaths[$playlistPath] = $true
 
-            # Mark source files as used
             foreach ($sf in $sorted) {
                 $full = Join-Path $sf.Directory $sf.FileName
                 $usedFiles[$full] = $true
             }
 
-            # Increment per-platform counts
             $platformLabel = Get-PlatformCountLabel -Directory $directory -ScriptDir $scriptDir
             if (-not $platformCounts.ContainsKey($platformLabel)) { $platformCounts[$platformLabel] = 0 }
             $platformCounts[$platformLabel]++
@@ -1459,10 +1376,8 @@ foreach ($group in $groupsStrict) {
 # PHASE 4: FLUSH GAMELIST CHANGES (NON-M3U PLATFORMS)
 # ==================================================================================================
 
-# Announce finalization phase
 Write-Phase "Finalizing gamelist.xml updates (if any)..."
 
-# Write any changed gamelist states back to disk (or just mark as changed in dry-run)
 foreach ($k in $gamelistStateByPlatform.Keys) {
     $st = $gamelistStateByPlatform[$k]
     if ($null -ne $st) {
@@ -1474,36 +1389,34 @@ foreach ($k in $gamelistStateByPlatform.Keys) {
 # PHASE 5: STRUCTURED REPORTING (SPLIT: M3U PLAYLISTS vs GAMELIST(S) UPDATED)
 # ==================================================================================================
 
-# Establish whether we had any M3U-related activity (written or suppressed)
 $anyM3UActivity =
     (@($m3uWrittenPlaylistPaths.Keys).Count -gt 0) -or
     (@($suppressedPreExistingPlaylists.Keys).Count -gt 0) -or
     (@($suppressedDuplicatePlaylists.Keys).Count -gt 0)
 
-# Establish whether we had any gamelist-related activity (non-M3U sets identified/hid/missing)
 $anyGamelistActivity =
     (@($noM3UPrimaryEntriesOk).Count -gt 0) -or
     (@($noM3UPrimaryEntriesIncomplete).Count -gt 0) -or
+    (@($noM3UNoDisk1Sets).Count -gt 0) -or
     (@($noM3UNewlyHidden).Count -gt 0) -or
     (@($noM3UAlreadyHidden).Count -gt 0) -or
+    (@($noM3UNewlyUnhidden).Count -gt 0) -or
+    (@($noM3UAlreadyVisible).Count -gt 0) -or
     (@($noM3UMissingGamelistEntries).Count -gt 0) -or
     ($gamelistHiddenCounts.Count -gt 0) -or
-    ($gamelistAlreadyHiddenCounts.Count -gt 0)
+    ($gamelistAlreadyHiddenCounts.Count -gt 0) -or
+    ($gamelistUnhiddenCounts.Count -gt 0) -or
+    ($gamelistAlreadyVisibleCounts.Count -gt 0)
 
-# If nothing happened at all, show a single clear message and stop
 if (-not $anyM3UActivity -and -not $anyGamelistActivity) {
     Write-Host ""
     Write-Host "M3U PLAYLISTS" -ForegroundColor Green
     Write-Host "No viable multi-disk files were found to create playlists from." -ForegroundColor Yellow
 } else {
 
-    # --------------------------------------------------------------------------------------------------
-    # SECTION: M3U PLAYLISTS
-    # --------------------------------------------------------------------------------------------------
     Write-Host ""
     Write-Host "M3U PLAYLISTS" -ForegroundColor Green
 
-    # Subsection: created M3U playlists (actually written this run)
     if (@($m3uWrittenPlaylistPaths.Keys).Count -gt 0) {
         Write-Host ""
         Write-Host "CREATED" -ForegroundColor Green
@@ -1512,13 +1425,11 @@ if (-not $anyM3UActivity -and -not $anyGamelistActivity) {
 
             $p = $_
 
-            # If we overwrote a differing playlist, highlight it
             if ($overwrittenExistingPlaylists.ContainsKey($p)) {
                 Write-Host "$p" -NoNewline
                 Write-Host " — Overwrote existing playlist that contained content discrepancy" -ForegroundColor Yellow
             } else {
 
-                # If dry-run, explicitly label the action
                 if ($dryRun) {
                     Write-Host "$p" -NoNewline
                     Write-Host " — DRY RUN (would write)" -ForegroundColor Yellow
@@ -1528,7 +1439,6 @@ if (-not $anyM3UActivity -and -not $anyGamelistActivity) {
             }
         }
     }
-    # No created M3Us
     else {
         if ($dryRun) {
             Write-Host "No M3U playlists were written (DRY RUN)." -ForegroundColor Yellow
@@ -1537,14 +1447,12 @@ if (-not $anyM3UActivity -and -not $anyGamelistActivity) {
         }
     }
 
-    # Subsection: suppressed due to identical pre-existing content
     if (@($suppressedPreExistingPlaylists.Keys).Count -gt 0) {
         Write-Host ""
         Write-Host "SUPPRESSED (PRE-EXISTING PLAYLIST CONTAINED IDENTICAL CONTENT)" -ForegroundColor Green
         $suppressedPreExistingPlaylists.Keys | Sort-Object | ForEach-Object { Write-Host $_ -ForegroundColor Gray }
     }
 
-    # Subsection: suppressed due to same-run duplicate collision
     if (@($suppressedDuplicatePlaylists.Keys).Count -gt 0) {
         Write-Host ""
         Write-Host "SUPPRESSED (DUPLICATE CONTENT COLLISION DURING THIS RUN)" -ForegroundColor Green
@@ -1554,20 +1462,15 @@ if (-not $anyM3UActivity -and -not $anyGamelistActivity) {
         }
     }
 
-    # --------------------------------------------------------------------------------------------------
-    # SECTION: GAMELIST(S) UPDATED (NON-M3U PLATFORMS)
-    # --------------------------------------------------------------------------------------------------
     if ($anyGamelistActivity) {
         Write-Host ""
 
-        # Heading reflects dry-run state
         if ($dryRun) {
             Write-Host "GAMELIST(S) UPDATED (DRY RUN — NO FILES MODIFIED)" -ForegroundColor Green
         } else {
             Write-Host "GAMELIST(S) UPDATED" -ForegroundColor Green
         }
 
-        # List which gamelist.xml files were (or would be) modified
         $changedGamelists = @()
         foreach ($k in $gamelistStateByPlatform.Keys) {
             $st = $gamelistStateByPlatform[$k]
@@ -1576,7 +1479,6 @@ if (-not $anyM3UActivity -and -not $anyGamelistActivity) {
             }
         }
 
-        # Print modified gamelist paths (one per line)
         if ($changedGamelists.Count -gt 0) {
             $changedGamelists | Sort-Object -Unique | ForEach-Object {
                 Write-Host "$_" -NoNewline
@@ -1587,11 +1489,9 @@ if (-not $anyM3UActivity -and -not $anyGamelistActivity) {
                 }
             }
         } else {
-            # If we had non-M3U activity but no gamelist changes, say so explicitly
             Write-Host "No gamelist.xml files required modification." -ForegroundColor Yellow
         }
 
-        # Subsection: non-M3U sets identified (primary entries kept visible) — OK
         if (@($noM3UPrimaryEntriesOk).Count -gt 0) {
             Write-Host ""
             Write-Host "NON-M3U SETS IDENTIFIED (PRIMARY ENTRIES KEPT VISIBLE — OK)" -ForegroundColor Green
@@ -1601,7 +1501,6 @@ if (-not $anyM3UActivity -and -not $anyGamelistActivity) {
             }
         }
 
-        # Subsection: non-M3U sets identified (primary entries kept visible) — SET INCOMPLETE
         if (@($noM3UPrimaryEntriesIncomplete).Count -gt 0) {
             Write-Host ""
             Write-Host "NON-M3U SETS IDENTIFIED (PRIMARY ENTRIES KEPT VISIBLE — SET INCOMPLETE)" -ForegroundColor Green
@@ -1611,7 +1510,15 @@ if (-not $anyM3UActivity -and -not $anyGamelistActivity) {
             }
         }
 
-        # Subsection: newly hidden entries
+        if (@($noM3UNoDisk1Sets).Count -gt 0) {
+            Write-Host ""
+            Write-Host "NON-M3U SETS IDENTIFIED (NO DISK 1 — SET INCOMPLETE)" -ForegroundColor Green
+            $noM3UNoDisk1Sets | Sort-Object FullPath | ForEach-Object {
+                Write-Host "$($_.FullPath)" -NoNewline
+                Write-Host " — $($_.Reason)" -ForegroundColor Yellow
+            }
+        }
+
         if (@($noM3UNewlyHidden).Count -gt 0) {
             Write-Host ""
             Write-Host "HIDDEN ENTRIES (NEW)" -ForegroundColor Green
@@ -1625,7 +1532,6 @@ if (-not $anyM3UActivity -and -not $anyGamelistActivity) {
             }
         }
 
-        # Subsection: already hidden entries
         if (@($noM3UAlreadyHidden).Count -gt 0) {
             Write-Host ""
             Write-Host "ENTRIES ALREADY HIDDEN (NO CHANGE)" -ForegroundColor Green
@@ -1635,7 +1541,28 @@ if (-not $anyM3UActivity -and -not $anyGamelistActivity) {
             }
         }
 
-        # Subsection: missing from gamelist.xml
+        if (@($noM3UNewlyUnhidden).Count -gt 0) {
+            Write-Host ""
+            Write-Host "UNHIDDEN ENTRIES (NEW)" -ForegroundColor Green
+            $noM3UNewlyUnhidden | Sort-Object FullPath | ForEach-Object {
+                Write-Host "$($_.FullPath)" -NoNewline
+                if ($dryRun) {
+                    Write-Host " — DRY RUN (would unhide in gamelist.xml)" -ForegroundColor Yellow
+                } else {
+                    Write-Host " — $($_.Reason)" -ForegroundColor Yellow
+                }
+            }
+        }
+
+        if (@($noM3UAlreadyVisible).Count -gt 0) {
+            Write-Host ""
+            Write-Host "ENTRIES ALREADY VISIBLE (NO CHANGE)" -ForegroundColor Green
+            $noM3UAlreadyVisible | Sort-Object FullPath | ForEach-Object {
+                Write-Host "$($_.FullPath)" -NoNewline
+                Write-Host " — $($_.Reason)" -ForegroundColor Yellow
+            }
+        }
+
         if (@($noM3UMissingGamelistEntries).Count -gt 0) {
             Write-Host ""
             Write-Host "ENTRIES MISSING FROM GAMELIST (RUN GAMELIST UPDATE, SCRAPE THE GAME OR MANUALLY ADD IT INTO GAMELIST.XML)" -ForegroundColor Green
@@ -1651,29 +1578,22 @@ if (-not $anyM3UActivity -and -not $anyGamelistActivity) {
 # PHASE 6: REPORTING — (POSSIBLE) MULTI-DISK FILES SKIPPED
 # ==================================================================================================
 
-# Establish skipped-report bucket as ArrayList for stability on large runs
 $notInPlaylists = [System.Collections.ArrayList]::new()
 
-# Group by TitleKey to detect orphaned Disk 2+ or incomplete sets
 $groupsForNotUsed = $parsed | Group-Object TitleKey
 foreach ($g in $groupsForNotUsed) {
 
     $gFiles = $g.Group
 
-    # --------------------------------------------------------------------------------------------------
-    # CASE: Only one file in the title group
-    # --------------------------------------------------------------------------------------------------
     if (@($gFiles).Count -lt 2) {
 
         $f = $gFiles[0]
         $full = Join-Path $f.Directory $f.FileName
 
-        # Determine if this singleton should be reported as an orphan (Disk 2+ or Total >= 2)
         $shouldReportSingleton =
             (($f.TotalDisks -ne $null -and $f.TotalDisks -ge 2) -or
              ($f.DiskSort -ne $null -and $f.DiskSort -ge 2))
 
-        # If it should be reported and was not used, add to skipped list
         if ($shouldReportSingleton -and (-not $usedFiles.ContainsKey($full))) {
 
             if ($noM3UMissingGamelistEntryByFullPath.ContainsKey($full)) {
@@ -1692,11 +1612,6 @@ foreach ($g in $groupsForNotUsed) {
         continue
     }
 
-    # --------------------------------------------------------------------------------------------------
-    # CASE: Multi-file title group — compute expected disks and analyze unused entries
-    # --------------------------------------------------------------------------------------------------
-
-    # Determine which disk numbers are present in this title group
     $diskSet = @(
         $gFiles |
             Where-Object { $_.DiskSort -ne $null } |
@@ -1705,14 +1620,12 @@ foreach ($g in $groupsForNotUsed) {
     )
     if ($diskSet.Count -eq 0) { continue }
 
-    # Determine max explicit total (if any)
     $maxTotal = ($gFiles |
         Where-Object { $_.TotalDisks -ne $null } |
         Select-Object -ExpandProperty TotalDisks |
         Sort-Object -Descending |
         Select-Object -First 1)
 
-    # Build expected disks either from explicit total or from maximum disk seen
     $expectedDisks = @()
     if ($null -ne $maxTotal -and $maxTotal -ne "") { $expectedDisks = 1..([int]$maxTotal) }
     else {
@@ -1720,7 +1633,6 @@ foreach ($g in $groupsForNotUsed) {
         if ($null -ne $maxDisk) { $expectedDisks = 1..([int]$maxDisk) } else { $expectedDisks = $diskSet }
     }
 
-    # Build a map of disk -> list of alts present (helps detect alt mismatch issues)
     $altByDisk = @{}
     foreach ($x in $gFiles) {
         if ($null -eq $x.DiskSort) { continue }
@@ -1730,7 +1642,6 @@ foreach ($g in $groupsForNotUsed) {
         if (-not ($altByDisk[$dsk] -contains $a)) { $altByDisk[$dsk] += $a }
     }
 
-    # Determine whether disk totals disagree across files (for reason labeling)
     $totalsDistinct = @(
         $gFiles | Where-Object { $_.TotalDisks -ne $null } |
             Select-Object -ExpandProperty TotalDisks | Sort-Object -Unique
@@ -1742,19 +1653,16 @@ foreach ($g in $groupsForNotUsed) {
         $maxTotalLocal = ($totalsDistinct | Sort-Object -Descending | Select-Object -First 1)
     }
 
-    # Compute missing disks
     $missingDisks = @()
     foreach ($ed in $expectedDisks) {
         if (-not ($diskSet -contains $ed)) { $missingDisks += $ed }
     }
 
-    # Inspect each file in the title group; report those that were not used
     foreach ($f in $gFiles) {
 
         $full = Join-Path $f.Directory $f.FileName
         if ($usedFiles.ContainsKey($full)) { continue }
 
-        # If this file is known missing from gamelist.xml for NON-M3U, prefer that reason
         if ($noM3UMissingGamelistEntryByFullPath.ContainsKey($full)) {
             [void]$notInPlaylists.Add([PSCustomObject]@{
                 FullPath = $full
@@ -1763,7 +1671,6 @@ foreach ($g in $groupsForNotUsed) {
             continue
         }
 
-        # Suppress reporting for non-M3U subfolders (only report root folder issues there)
         $plat = Get-PlatformRootName -Directory $f.Directory -ScriptDir $scriptDir
         if ($null -ne $plat) {
 
@@ -1778,15 +1685,25 @@ foreach ($g in $groupsForNotUsed) {
                         continue
                     }
                 } catch {
-                    # If resolution fails, fall through and report rather than silently skipping
                 }
             }
         }
 
-        # Default reason (may be refined below)
         $reason = "Unselected during fill"
 
-        # Apply [!] suppression reason if applicable
+        if ($f.DiskSort -ne $null) {
+
+            $winner = $gFiles | Where-Object {
+                $_.DiskSort -eq $f.DiskSort -and
+                $usedFiles.ContainsKey((Join-Path $_.Directory $_.FileName))
+            } | Select-Object -First 1
+
+            if ($null -ne $winner) {
+                $winnerFull = Join-Path $winner.Directory $winner.FileName
+                $reason = "Unselected during fill (Disk $($f.DiskSort) chosen instead: $winnerFull)"
+            }
+        }
+
         $hasBangInThisFile = ($f.BaseTagsKey -match '\[\!\]')
         $altNorm = Normalize-Alt $f.AltTag
         if (-not $hasBangInThisFile -and $altNorm) {
@@ -1799,17 +1716,14 @@ foreach ($g in $groupsForNotUsed) {
             }
         }
 
-        # If disks are missing in this title group, treat as incomplete set
         if ($reason -eq "Unselected during fill" -and $missingDisks.Count -gt 0) {
             $reason = "Missing matching disk"
         }
 
-        # If no disks missing but alt exists, a failure might be due to alt fallback
         if ($reason -eq "Unselected during fill" -and $missingDisks.Count -eq 0 -and $altNorm) {
             $reason = "Alt fallback failed"
         }
 
-        # If alt fallback failed, add more detail when the alt doesn't appear elsewhere across disks
         if ($reason -eq "Alt fallback failed") {
             $aHere = Normalize-Alt $f.AltTag
             if ($aHere) {
@@ -1822,12 +1736,14 @@ foreach ($g in $groupsForNotUsed) {
             }
         }
 
-        # Normalize "Missing matching disk" to "Incomplete disk set" for final reporting
         if ($reason -eq "Missing matching disk" -and $missingDisks.Count -gt 0) {
             $reason = "Incomplete disk set"
         }
 
-        # If totals disagree and this file appears beyond the minimum total, flag disk total mismatch
+        if ($reason -eq "Incomplete disk set" -and ($missingDisks -contains 1)) {
+            $reason = "Incomplete disk set (missing Disk 1)"
+        }
+
         if ($reason -eq "Unselected during fill" -and
             $null -ne $minTotal -and $null -ne $maxTotalLocal -and
             $minTotal -ne $maxTotalLocal -and
@@ -1836,7 +1752,6 @@ foreach ($g in $groupsForNotUsed) {
             $reason += " due to disk total mismatch"
         }
 
-        # Add to skipped-report bucket
         [void]$notInPlaylists.Add([PSCustomObject]@{
             FullPath = $full
             Reason   = $reason
@@ -1844,7 +1759,6 @@ foreach ($g in $groupsForNotUsed) {
     }
 }
 
-# Print skipped report if any entries exist
 if (@($notInPlaylists).Count -gt 0) {
     Write-Host ""
     Write-Host "(POSSIBLE) MULTI-DISK FILES SKIPPED" -ForegroundColor Green
@@ -1858,7 +1772,6 @@ if (@($notInPlaylists).Count -gt 0) {
 # PHASE 7: SUMMARY COUNTS
 # ==================================================================================================
 
-# --- REPORT: PLAYLIST CREATION COUNT(S) ---
 if ($platformCounts.Count -gt 0 -or $totalPlaylistsCreated -gt 0) {
     Write-Host ""
     Write-Host "PLAYLIST CREATION COUNT(S)" -ForegroundColor Green
@@ -1870,13 +1783,13 @@ if ($platformCounts.Count -gt 0 -or $totalPlaylistsCreated -gt 0) {
     Write-Host " $totalPlaylistsCreated"
 }
 
-# --- REPORT: GAMELIST HIDDEN ENTRY COUNT(S) ---
+# Hide this entire count section when TOTAL = 0 (even if keys exist with zero values)
 $gamelistHiddenTotal = 0
-if ($gamelistHiddenCounts.Count -gt 0) {
+foreach ($kv in $gamelistHiddenCounts.GetEnumerator()) { $gamelistHiddenTotal += [int]$kv.Value }
+if ($gamelistHiddenTotal -gt 0) {
     Write-Host ""
     Write-Host "GAMELIST HIDDEN ENTRY COUNT(S)" -ForegroundColor Green
     $gamelistHiddenCounts.GetEnumerator() | Sort-Object Name | ForEach-Object {
-        $gamelistHiddenTotal += [int]$_.Value
         Write-Host "$($_.Name):" -ForegroundColor Cyan -NoNewline
         Write-Host " $($_.Value)"
     }
@@ -1884,13 +1797,13 @@ if ($gamelistHiddenCounts.Count -gt 0) {
     Write-Host " $gamelistHiddenTotal"
 }
 
-# --- REPORT: GAMELIST ALREADY-HIDDEN COUNT(S) ---
+# Hide this entire count section when TOTAL = 0 (even if keys exist with zero values)
 $gamelistAlreadyHiddenTotal = 0
-if ($gamelistAlreadyHiddenCounts.Count -gt 0) {
+foreach ($kv in $gamelistAlreadyHiddenCounts.GetEnumerator()) { $gamelistAlreadyHiddenTotal += [int]$kv.Value }
+if ($gamelistAlreadyHiddenTotal -gt 0) {
     Write-Host ""
     Write-Host "GAMELIST ALREADY-HIDDEN COUNT(S)" -ForegroundColor Green
     $gamelistAlreadyHiddenCounts.GetEnumerator() | Sort-Object Name | ForEach-Object {
-        $gamelistAlreadyHiddenTotal += [int]$_.Value
         Write-Host "$($_.Name):" -ForegroundColor Cyan -NoNewline
         Write-Host " $($_.Value)"
     }
@@ -1898,7 +1811,20 @@ if ($gamelistAlreadyHiddenCounts.Count -gt 0) {
     Write-Host " $gamelistAlreadyHiddenTotal"
 }
 
-# --- REPORT: SUPPRESSED PLAYLIST COUNT(S) ---
+# Hide this entire count section when TOTAL = 0 (even if keys exist with zero values)
+$gamelistUnhiddenTotal = 0
+foreach ($kv in $gamelistUnhiddenCounts.GetEnumerator()) { $gamelistUnhiddenTotal += [int]$kv.Value }
+if ($gamelistUnhiddenTotal -gt 0) {
+    Write-Host ""
+    Write-Host "GAMELIST UNHIDDEN ENTRY COUNT(S)" -ForegroundColor Green
+    $gamelistUnhiddenCounts.GetEnumerator() | Sort-Object Name | ForEach-Object {
+        Write-Host "$($_.Name):" -ForegroundColor Cyan -NoNewline
+        Write-Host " $($_.Value)"
+    }
+    Write-Host "TOTAL:" -ForegroundColor White -NoNewline
+    Write-Host " $gamelistUnhiddenTotal"
+}
+
 $preExistingSuppressedCount = @($suppressedPreExistingPlaylists.Keys).Count
 $collisionSuppressedCount   = @($suppressedDuplicatePlaylists.Keys).Count
 $totalSuppressedCount       = $preExistingSuppressedCount + $collisionSuppressedCount
@@ -1914,7 +1840,6 @@ if ($totalSuppressedCount -gt 0) {
     Write-Host " $totalSuppressedCount"
 }
 
-# --- REPORT: SKIPPED MULTI-DISK FILE COUNT ---
 if (@($notInPlaylists).Count -gt 0) {
     Write-Host ""
     Write-Host "MULTI-DISK FILE SKIP COUNT" -ForegroundColor Green
@@ -1926,14 +1851,9 @@ if (@($notInPlaylists).Count -gt 0) {
 # PHASE 8: FINAL RUNTIME REPORT
 # ==================================================================================================
 
-# Compute elapsed runtime
 $elapsed = (Get-Date) - $scriptStart
 $totalSeconds = [int][math]::Floor($elapsed.TotalSeconds)
 
-# Format runtime as:
-# - X seconds (<60)
-# - M:SS (<60m)
-# - H:MM:SS (>=60m)
 $runtimeText = ""
 if ($totalSeconds -lt 60) {
     $runtimeText = "$totalSeconds seconds"
@@ -1949,7 +1869,6 @@ if ($totalSeconds -lt 60) {
     $runtimeText = "{0}:{1:D2}:{2:D2}" -f $h, $m, $s
 }
 
-# Print runtime
 Write-Host ""
 Write-Host "Runtime:" -ForegroundColor White -NoNewline
 Write-Host " $runtimeText"
