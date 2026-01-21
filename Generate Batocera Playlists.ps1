@@ -1,6 +1,6 @@
 <#
 PURPOSE: Create .m3u files for each multi-disk game and insert the list of game filenames into the playlist or update gamelist.xml
-VERSION: 1.3
+VERSION: 1.4
 AUTHOR: Devin Kelley, Distant Thunderworks LLC
 
 NOTES:
@@ -13,6 +13,7 @@ NOTES:
     - $dryRun : default is $false; set to $true to preview output without modifying files
     - $nonM3UPlatforms : array of platforms (folder names) that should NOT use M3U; default: 3DO + apple2
     - $noM3UPlatformMode : default "XML"; set to "skip" to ignore NON-M3U platforms entirely
+- Bracket tags that simply restate the file extension (e.g., [nib] on a .nib file) are treated as non-grouping noise so they don't fragment otherwise-matching disk/side sets.
 
 BREAKDOWN
 - Enumerates ROM game files starting in the directory the script resides in
@@ -39,6 +40,7 @@ BREAKDOWN
     - Separates tags into:
         - Alt tags like [a], [a2], [b], [b3] (TOSEC-style), etc.
         - Other base tags like [cr ...], [! ], etc.
+    - Ignores bracket tags that simply mirror the file extension (e.g., [nib] on .nib) so they do not alter grouping or playlist naming.
     - Uses a “non-bang” compatibility key:
         - Treats sets as compatible when only [!] differs across files (helpful when some disks include [!] and others don’t)
 - Groups files into candidate multi-disk sets and selects the best disk entries
@@ -272,6 +274,35 @@ function Is-AltTag {
 function Is-DiskNoiseTag {
     param([string]$Tag)
     return ($Tag -match '^\[(?i)\s*disks?\b')
+}
+
+# --- FUNCTION: Is-ExtensionNoiseTag ---
+# PURPOSE:
+# - Detect bracket tags that restate the file extension (e.g., "[nib]" on a ".nib" file).
+# NOTES:
+# - Prevents format-indicator brackets from fragmenting grouping/playlist naming across mixed-format sets.
+# - Intentionally does not treat TOSEC-style alt tags as extension noise.
+function Is-ExtensionNoiseTag {
+    param(
+        [Parameter(Mandatory=$true)][string]$Tag,
+        [Parameter(Mandatory=$true)][string]$FileName
+    )
+
+    # Do not treat alt tags as extension noise
+    if (Is-AltTag $Tag) { return $false }
+
+    # Determine extension (without dot)
+    $ext = [System.IO.Path]::GetExtension($FileName)
+    if ([string]::IsNullOrWhiteSpace($ext)) { return $false }
+    $extNoDot = $ext.TrimStart('.')
+    if ([string]::IsNullOrWhiteSpace($extNoDot)) { return $false }
+
+    # Extract inner tag content
+    $m = [regex]::Match($Tag, '^\[(?<X>[^\]]+)\]$')
+    if (-not $m.Success) { return $false }
+    $inner = $m.Groups['X'].Value.Trim()
+
+    return ($inner -ieq $extNoDot)
 }
 
 # --- FUNCTION: Clean-BasePrefix ---
@@ -630,7 +661,7 @@ function Hide-GameEntriesInGamelist {
     # Process each file target that should be hidden
     foreach ($t in $Targets) {
 
-        # Establish the expected <path> value in gamelist.xml (./rel/path with / separators)
+        # Establish the expected <path> value in gamelist.xml (./whatever</path> (capture indentation for insertion)
         $rel = $t.RelPath
         if ([string]::IsNullOrWhiteSpace($rel)) {
 
@@ -841,11 +872,13 @@ function Parse-GameFile {
     $mHint = [regex]::Match($beforeBracket, '^\s*(\([^\)]+\))')
     if ($mHint.Success) { $nameHint = $mHint.Groups[1].Value }
 
-    # Gather bracket tags (excluding disk-noise tags)
+    # Gather bracket tags (excluding disk-noise tags and extension-mirroring tags)
     $bracketTags = @()
     foreach ($m in [regex]::Matches($afterNorm, '\[[^\]]+\]')) {
         $tag = $m.Value
-        if (-not (Is-DiskNoiseTag $tag)) { $bracketTags += $tag }
+        if (Is-DiskNoiseTag $tag) { continue }
+        if (Is-ExtensionNoiseTag -Tag $tag -FileName $FileName) { continue }
+        $bracketTags += $tag
     }
 
     # Split tags into alt tag (single) and base tags (remaining)
@@ -1317,6 +1350,7 @@ foreach ($group in $groupsStrict) {
 
                 # Establish primary entry to keep visible: the first file in sorted set
                 $primaryFull = Join-Path $sorted[0].Directory $sorted[0].FileName
+                $usedFiles[$primaryFull] = $true
 
                 # If the set is incomplete, do not hide anything; keep visible and annotate
                 if ($setIsIncomplete) {
