@@ -1,5 +1,5 @@
 <#
-PURPOSE: Converts the CSV exported by the "Export Batocera Game List" script into an Excel .xlsx workbook
+PURPOSE: Converts the CSV exported by the "Export Batocera Game List.ps1" script into an Excel .xlsx workbook
 VERSION: 1.0
 AUTHOR: Devin Kelley, Distant Thunderworks LLC
 
@@ -801,3 +801,4 @@ finally {
     [GC]::Collect()
     [GC]::WaitForPendingFinalizers()
 }
+
