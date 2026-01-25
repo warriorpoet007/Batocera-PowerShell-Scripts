@@ -1,4 +1,4 @@
-﻿<#
+<#
 PURPOSE: Converts the CSV exported by the "Export Batocera Game List" script into an Excel .xlsx workbook
 VERSION: 1.0
 AUTHOR: Devin Kelley, Distant Thunderworks LLC
@@ -23,6 +23,7 @@ FORMATTING PER SHEET:
 
 REQUIRES:
   - Microsoft Excel installed (desktop)
+  - If Excel isn't detected the script will abort
 #>
 
 # ---------------------------------------------
@@ -42,9 +43,24 @@ param(
     # Formatting toggle: AutoFit used columns on each sheet
     [switch]$AutoSize     = $true,
 
-    # Formatting toggle: freeze top row on sheets where freezing is applied
+    # Formatting toggle: freeze top row (only works when writing a single-worksheet file)
     [switch]$FreezeTopRow = $true
 )
+
+# -------------------------------------------------------------------------------------------------
+# Verify Microsoft Excel is installed before doing anything else
+# -------------------------------------------------------------------------------------------------
+try {
+    $testExcel = New-Object -ComObject Excel.Application
+    $testExcel.Quit()
+    [void][System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($testExcel)
+} catch {
+    Write-Host ""
+    Write-Host "Microsoft Excel does not appear to be installed on this system." -ForegroundColor Red
+    Write-Host "This script requires the desktop version of Excel to generate XLSX files." -ForegroundColor Red
+    Write-Host ""
+    return
+}
 
 # =================================================================================================
 # SECTION: UI mode helpers (GUI when STA, console fallback otherwise)
