@@ -12,6 +12,7 @@ NOTES:
     - Multi-M3U: the visible entry’s <path> ends in .m3u
     - Multi-XML: the visible entry has 1+ additional entries with the same group key where <hidden>true</hidden> is set
         - This is tailored to be run after first running the Generate Batocera Playlists.ps1 script
+        - Ensure that each disk listed in gamelist.xml is tagged with the same <name>Name Of the Game</name>
     - Single: neither of the above
 - Robustness:
     - Some gamelist.xml files in the wild can be malformed (mismatched tags, partial writes, etc.).
@@ -26,7 +27,7 @@ NOTES:
     - Always prints a final "finished" summary
 
 IMPORTANT NOTE
-- For multi-disk games, they must each have the same name in gamelist.xml, as this is what's used by the script to group them
+- For non-M3U multi-disk games, they must each have the same name in gamelist.xml, as this is what's used by the script to group them
     - In the example below, a game with three disks/filenames/paths are all part of the same game with the same name:
 
         <path>./Game ROM Image (Disk 1).chd</path>
