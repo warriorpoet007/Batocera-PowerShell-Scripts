@@ -1,6 +1,6 @@
 <#
 PURPOSE: Converts the CSV exported by the "Export Batocera Game List.ps1" script into an Excel .xlsx workbook
-VERSION: 1.0
+VERSION: 1.1
 AUTHOR: Devin Kelley, Distant Thunderworks LLC
 
 USER PROMPTS:
@@ -18,7 +18,7 @@ FORMATTING PER SHEET:
   - DiskCount column: centered
   - AutoFilter enabled
   - AutoFit columns
-  - Freeze top row enabled (single worksheet only; split-mode behavior depends on Excel window context)
+  - Freeze top row enabled (single worksheet only)
   - Selects A1 so the workbook opens without a large selection
 
 REQUIRES:
@@ -43,7 +43,7 @@ param(
     # Formatting toggle: AutoFit used columns on each sheet
     [switch]$AutoSize     = $true,
 
-    # Formatting toggle: freeze top row (only works when writing a single-worksheet file)
+    # Formatting toggle: freeze top row (single-sheet mode only)
     [switch]$FreezeTopRow = $true
 )
 
@@ -63,8 +63,10 @@ try {
 }
 
 # =================================================================================================
-# SECTION: UI mode helpers (GUI when STA, console fallback otherwise)
+# SECTION: UI mode helpers (GUI when STA + WinForms available, console fallback otherwise)
 # =================================================================================================
+
+$script:WinFormsOk = $false
 
 function Test-IsSTA {
     # Detect whether the current PowerShell thread is running in STA mode (needed for WinForms dialogs)
@@ -79,6 +81,10 @@ function Ensure-WinForms {
 
     # Enable WinForms visual styles (non-fatal if unavailable)
     try { [System.Windows.Forms.Application]::EnableVisualStyles() } catch {}
+}
+
+function Can-UseGui {
+    return ((Test-IsSTA) -and $script:WinFormsOk)
 }
 
 function Show-TopMostMessageBox {
@@ -119,32 +125,24 @@ function Ask-SplitMode {
     #>
     param([string]$SplitColumnName)
 
-    # Build the prompt text
     $msg = "Split into separate worksheets by '$SplitColumnName'?" + [Environment]::NewLine +
            "Yes = one tab per value" + [Environment]::NewLine +
            "No  = all rows in a single tab"
 
-    # Set the dialog title
     $title = "CSV → XLSX Options"
 
-    # Write a visible cue in the console
     Write-Host ""
     Write-Host "Prompt: choose split mode..." -ForegroundColor Cyan
 
-    if (Test-IsSTA) {
-        # GUI prompt using a top-most message box
+    if (Can-UseGui) {
         $result = Show-TopMostMessageBox -Text $msg -Title $title `
             -Buttons ([System.Windows.Forms.MessageBoxButtons]::YesNo) `
             -Icon ([System.Windows.Forms.MessageBoxIcon]::Question)
 
-        # Convert DialogResult to a boolean split flag
         return ($result -eq [System.Windows.Forms.DialogResult]::Yes)
     } else {
-        # Console prompt fallback
         Write-Host $msg
         $ans = Read-Host "Type Y for Yes (split) or N for No (single sheet)"
-
-        # Treat Y/y as split mode
         return ($ans -match '^(?i)y')
     }
 }
@@ -152,14 +150,13 @@ function Ask-SplitMode {
 function Pick-CsvFile {
     <#
       Prompts the user to select a CSV file:
-        - GUI OpenFileDialog when STA
+        - GUI OpenFileDialog when STA + WinForms available
         - Console prompt otherwise
     #>
     Write-Host ""
     Write-Host "Prompt: choose CSV file..." -ForegroundColor Cyan
 
-    if (Test-IsSTA) {
-        # Create a tiny off-screen top-most owner window for the file dialog
+    if (Can-UseGui) {
         $owner = New-Object System.Windows.Forms.Form
         $owner.TopMost = $true
         $owner.StartPosition = 'Manual'
@@ -169,7 +166,6 @@ function Pick-CsvFile {
         $owner.Show() | Out-Null
 
         try {
-            # Configure the OpenFileDialog
             $dlg = New-Object System.Windows.Forms.OpenFileDialog
             $dlg.Title = "Select CSV file to convert"
             $dlg.Filter = "CSV files (*.csv)|*.csv|All files (*.*)|*.*"
@@ -177,24 +173,15 @@ function Pick-CsvFile {
             $dlg.CheckFileExists = $true
             $dlg.RestoreDirectory = $true
 
-            # Return $null on cancel
             if ($dlg.ShowDialog($owner) -ne [System.Windows.Forms.DialogResult]::OK) { return $null }
-
-            # Return selected file path
             return $dlg.FileName
         } finally {
-            # Clean up the owner form
             $owner.Close()
             $owner.Dispose()
         }
     } else {
-        # Console prompt fallback
         $p = Read-Host "Enter full path to the CSV file"
-
-        # Treat blank as cancel
         if ([string]::IsNullOrWhiteSpace($p)) { return $null }
-
-        # Return typed path
         return $p
     }
 }
@@ -205,7 +192,7 @@ function Pick-XlsxSavePath {
         - Starts in InitialDirectory when possible
         - Pre-fills SuggestedFileName
         - Adds .xlsx extension when omitted
-        - GUI SaveFileDialog when STA
+        - GUI SaveFileDialog when STA + WinForms available
         - Console prompt otherwise
     #>
     param(
@@ -216,8 +203,7 @@ function Pick-XlsxSavePath {
     Write-Host ""
     Write-Host "Prompt: choose XLSX save location..." -ForegroundColor Cyan
 
-    if (Test-IsSTA) {
-        # Create a tiny off-screen top-most owner window for the file dialog
+    if (Can-UseGui) {
         $owner = New-Object System.Windows.Forms.Form
         $owner.TopMost = $true
         $owner.StartPosition = 'Manual'
@@ -227,7 +213,6 @@ function Pick-XlsxSavePath {
         $owner.Show() | Out-Null
 
         try {
-            # Configure the SaveFileDialog
             $dlg = New-Object System.Windows.Forms.SaveFileDialog
             $dlg.Title = "Save XLSX as..."
             $dlg.Filter = "Excel Workbook (*.xlsx)|*.xlsx|All files (*.*)|*.*"
@@ -236,40 +221,27 @@ function Pick-XlsxSavePath {
             $dlg.AddExtension = $true
             $dlg.DefaultExt   = "xlsx"
 
-            # Set initial directory when it exists
             if (-not [string]::IsNullOrWhiteSpace($InitialDirectory) -and (Test-Path -LiteralPath $InitialDirectory)) {
                 $dlg.InitialDirectory = $InitialDirectory
             }
 
-            # Pre-fill the output filename
             $dlg.FileName = $SuggestedFileName
 
-            # Return $null on cancel
             if ($dlg.ShowDialog($owner) -ne [System.Windows.Forms.DialogResult]::OK) { return $null }
-
-            # Return selected path
             return $dlg.FileName
         } finally {
-            # Clean up the owner form
             $owner.Close()
             $owner.Dispose()
         }
     } else {
-        # Show suggested output path
         Write-Host "Suggested output: $(Join-Path $InitialDirectory $SuggestedFileName)"
-
-        # Console prompt fallback
         $p = Read-Host "Enter full path where to save the XLSX (or press Enter to accept suggested)"
 
-        # Accept suggested output on empty input
         if ([string]::IsNullOrWhiteSpace($p)) {
-            return (Join-Path $InitialDirectory $SuggestedFileName)
+            $p = (Join-Path $InitialDirectory $SuggestedFileName)
         }
 
-        # Append extension if missing
         if ([System.IO.Path]::GetExtension($p) -eq "") { $p = $p + ".xlsx" }
-
-        # Return typed output path
         return $p
     }
 }
@@ -286,30 +258,21 @@ function Freeze-WorksheetTopRow {
     param([Parameter(Mandatory=$true)]$Worksheet)
 
     try {
-        # Get the workbook containing the worksheet
         $wb = $Worksheet.Parent
-
-        # Activate workbook and worksheet to establish context for window operations
         $null = $wb.Activate()
         $null = $Worksheet.Activate()
 
-        # Retrieve the first window for the workbook
         $wnd = $null
         try { $wnd = $wb.Windows.Item(1) } catch {}
 
-        # Exit if a window is not available
         if ($null -eq $wnd) { return }
 
-        # Clear any prior freeze or split settings
         $wnd.FreezePanes  = $false
         $wnd.SplitRow     = 0
         $wnd.SplitColumn  = 0
 
-        # Select the row below the header so Excel freezes row 1
         $null = $Worksheet.Range("A2").Select()
         $wnd.FreezePanes = $true
-
-        # Return selection to A1
         $null = $Worksheet.Range("A1").Select()
     } catch {
         # Ignore freeze failures
@@ -329,22 +292,13 @@ function Sanitize-SheetName {
     #>
     param([Parameter(Mandatory=$true)][string]$Name)
 
-    # Start with the raw name
     $n = $Name
-
-    # Replace invalid characters with underscores
     $n = $n -replace '[:\\\/\?\*\[\]]', '_'
-
-    # Trim whitespace
     $n = $n.Trim()
 
-    # Use a fallback if empty
     if ([string]::IsNullOrWhiteSpace($n)) { $n = "Sheet" }
 
-    # Avoid trailing apostrophes
     $n = $n.TrimEnd("'")
-
-    # Truncate to Excel sheet name limit
     if ($n.Length -gt 31) { $n = $n.Substring(0,31) }
 
     return $n
@@ -359,33 +313,24 @@ function Get-UniqueSheetName {
         [Parameter(Mandatory=$true)][hashtable]$Used
     )
 
-    # Sanitize the base name first
     $base = Sanitize-SheetName $Name
     $candidate = $base
 
-    # Use base name if unused
     if (-not $Used.ContainsKey($candidate)) {
         $Used[$candidate] = $true
         return $candidate
     }
 
-    # Increment suffix until a unique name is found
     $i = 2
     while ($true) {
-        # Build suffix
         $suffix = " ($i)"
-
-        # Compute the maximum base length allowed when adding the suffix
         $maxBaseLen = 31 - $suffix.Length
 
-        # Trim base if needed
         $trimBase = $base
         if ($trimBase.Length -gt $maxBaseLen) { $trimBase = $trimBase.Substring(0, $maxBaseLen) }
 
-        # Combine trimmed base + suffix
         $candidate = $trimBase + $suffix
 
-        # Accept first unused candidate
         if (-not $Used.ContainsKey($candidate)) {
             $Used[$candidate] = $true
             return $candidate
@@ -399,20 +344,24 @@ function Get-UniqueSheetName {
 # SECTION: Excel COM constants + COM cleanup helper
 # =================================================================================================
 
-# Excel constant: horizontal alignment (left)
 $xlLeft   = -4131
-
-# Excel constant: horizontal alignment (center)
 $xlCenter = -4108
 
-# Excel constant: calculation mode (manual)
-$xlCalculationManual = -4135
-
-# Excel constant: calculation mode (automatic)
+$xlCalculationManual    = -4135
 $xlCalculationAutomatic = -4105
 
-# Excel constant: SaveAs format ID for .xlsx
-$xlOpenXMLWorkbook = 51
+$xlOpenXMLWorkbook      = 51
+
+# Paste constants (used already; keep explicit)
+$xlPasteValues  = -4163
+$xlPasteFormats = -4122
+
+# SpecialCells
+$xlCellTypeVisible = 12
+
+# OpenText constants
+$xlDelimited = 1
+$xlTextQualifierDoubleQuote = 1
 
 function Release-ComObject {
     <#
@@ -433,25 +382,25 @@ function Get-HeaderMap {
     #>
     param([Parameter(Mandatory=$true)]$Worksheet)
 
-    # Initialize mapping table
     $map = @{}
 
-    # Determine used range on the sheet
-    $used = $Worksheet.UsedRange
+    $used = $null
+    try { $used = $Worksheet.UsedRange } catch {}
     if ($null -eq $used) { return $map }
 
-    # Iterate columns in the used range
-    $colCount = $used.Columns.Count
-    for ($c = 1; $c -le $colCount; $c++) {
-        # Read cell text for the header label
-        $h = [string]$Worksheet.Cells.Item(1, $c).Text
+    $colCount = 0
+    try { $colCount = $used.Columns.Count } catch { $colCount = 0 }
 
-        # Store non-empty header labels
+    for ($c = 1; $c -le $colCount; $c++) {
+        $h = ""
+        try { $h = [string]$Worksheet.Cells.Item(1, $c).Text } catch { $h = "" }
+
         if (-not [string]::IsNullOrWhiteSpace($h)) {
             $map[$h] = $c
         }
     }
 
+    Release-ComObject $used
     return $map
 }
 
@@ -462,144 +411,209 @@ function Apply-WorksheetFormatting {
         - Formats specific columns by header name
         - Enables AutoFilter
         - AutoFits columns
-        - Freezes top row (if enabled)
+        - Freezes top row (when allowed)
         - Selects A1
     #>
-    param([Parameter(Mandatory=$true)]$Worksheet)
+    param(
+        [Parameter(Mandatory=$true)]$Worksheet,
+        [switch]$AllowFreezeTopRow = $true
+    )
 
-    # Determine used range
-    $used = $Worksheet.UsedRange
+    $used = $null
+    try { $used = $Worksheet.UsedRange } catch {}
     if ($null -eq $used) { return }
 
-    # Read used range bounds
-    $rowCount = $used.Rows.Count
-    $colCount = $used.Columns.Count
-    if ($rowCount -lt 1 -or $colCount -lt 1) { return }
+    $rowCount = 0
+    $colCount = 0
+    try { $rowCount = $used.Rows.Count } catch { $rowCount = 0 }
+    try { $colCount = $used.Columns.Count } catch { $colCount = 0 }
+    if ($rowCount -lt 1 -or $colCount -lt 1) { Release-ComObject $used; return }
 
-    # Build a header->column index map for the sheet
     $hdr = Get-HeaderMap -Worksheet $Worksheet
 
-    # Bold the header row
     try { $used.Rows.Item(1).Font.Bold = $true } catch {}
 
-    # Apply Title column formatting (rows 2..end)
+    # Title column formatting
     if ($hdr.ContainsKey("Title") -and $rowCount -ge 2) {
-        $c = [int]$hdr["Title"]
-        $rng = $Worksheet.Range($Worksheet.Cells.Item(2,$c), $Worksheet.Cells.Item($rowCount,$c))
-        $rng.NumberFormat = "@"
-        $rng.HorizontalAlignment = $xlLeft
+        $rng = $null
+        try {
+            $c = [int]$hdr["Title"]
+            $rng = $Worksheet.Range($Worksheet.Cells.Item(2,$c), $Worksheet.Cells.Item($rowCount,$c))
+            $rng.NumberFormat = "@"
+            $rng.HorizontalAlignment = $xlLeft
+        } catch {} finally {
+            if ($rng) { Release-ComObject $rng }
+        }
     }
 
-    # Apply DiskCount column formatting (rows 2..end)
+    # DiskCount column formatting
     if ($hdr.ContainsKey("DiskCount") -and $rowCount -ge 2) {
-        $c = [int]$hdr["DiskCount"]
-        $rng = $Worksheet.Range($Worksheet.Cells.Item(2,$c), $Worksheet.Cells.Item($rowCount,$c))
-        $rng.HorizontalAlignment = $xlCenter
+        $rng = $null
+        try {
+            $c = [int]$hdr["DiskCount"]
+            $rng = $Worksheet.Range($Worksheet.Cells.Item(2,$c), $Worksheet.Cells.Item($rowCount,$c))
+            $rng.HorizontalAlignment = $xlCenter
+        } catch {} finally {
+            if ($rng) { Release-ComObject $rng }
+        }
     }
 
-    # Enable AutoFilter on the used range
     if ($AutoFilter) { try { $null = $used.AutoFilter() } catch {} }
+    if ($AutoSize)   { try { $null = $used.Columns.AutoFit() } catch {} }
 
-    # AutoFit columns in the used range
-    if ($AutoSize) { try { $null = $used.Columns.AutoFit() } catch {} }
+    if ($AllowFreezeTopRow -and $FreezeTopRow) {
+        Freeze-WorksheetTopRow -Worksheet $Worksheet
+    }
 
-    # Freeze the top row (worksheet-level call)
-    if ($FreezeTopRow) { Freeze-WorksheetTopRow -Worksheet $Worksheet }
-
-    # Select A1 to avoid an expanded selection on open
     try {
         $null = $Worksheet.Activate()
         $null = $Worksheet.Range("A1").Select()
     } catch {}
+
+    Release-ComObject $used
+}
+
+# =================================================================================================
+# SECTION: CSV open helper (more locale-stable; falls back to Open)
+# =================================================================================================
+
+function Open-CsvWorkbook {
+    <#
+      Tries to open CSV using OpenText with an explicit comma delimiter (reduces locale delimiter issues).
+      Falls back to Workbooks.Open on failure.
+    #>
+    param(
+        [Parameter(Mandatory=$true)]$ExcelApp,
+        [Parameter(Mandatory=$true)][string]$CsvPath
+    )
+
+    # Try OpenText first
+    try {
+        $ExcelApp.Workbooks.OpenText(
+            $CsvPath,            # Filename
+            65001,               # Origin (attempt UTF-8 code page)
+            $null,               # StartRow
+            $xlDelimited,        # DataType
+            $xlTextQualifierDoubleQuote, # TextQualifier
+            $false,              # ConsecutiveDelimiter
+            $false,              # Tab
+            $false,              # Semicolon
+            $true,               # Comma
+            $false,              # Space
+            $false               # Other
+        ) | Out-Null
+
+        # When OpenText is used, Excel typically sets the opened workbook as ActiveWorkbook
+        return $ExcelApp.ActiveWorkbook
+    } catch {
+        # Fallback: classic Open (locale dependent)
+        return $ExcelApp.Workbooks.Open($CsvPath)
+    }
+}
+
+# =================================================================================================
+# SECTION: Split key normalization helpers
+# =================================================================================================
+
+function Normalize-ExcelTextForKey {
+    <#
+      Normalizes Excel cell .Text for stable key grouping & filtering:
+        - Converts NBSP to normal space
+        - Trims standard whitespace
+      IMPORTANT: We use the same normalized value both for key discovery and filtering, to reduce mismatches.
+    #>
+    param([AllowNull()][string]$Text)
+
+    if ($null -eq $Text) { return "" }
+
+    # Replace non-breaking space with regular space
+    $t = $Text -replace [char]0x00A0, ' '
+
+    # Trim regular whitespace
+    return $t.Trim()
 }
 
 # =================================================================================================
 # SECTION: Main workflow
 # =================================================================================================
 
-# Load WinForms when possible (non-fatal if unavailable)
-try { Ensure-WinForms } catch {}
+# Load WinForms when possible (do NOT swallow and then attempt GUI types)
+try {
+    Ensure-WinForms
+    $script:WinFormsOk = $true
+} catch {
+    $script:WinFormsOk = $false
+}
 
-# Prompt for split mode selection
 $splitMode = Ask-SplitMode -SplitColumnName $SplitByColumn
-
-# Prompt for source CSV file selection
 $csvPath = Pick-CsvFile
 
-# Exit on cancel
 if ([string]::IsNullOrWhiteSpace($csvPath)) {
     Write-Host "Cancelled (no CSV selected)." -ForegroundColor Yellow
     return
 }
 
-# Verify the CSV path exists
 if (-not (Test-Path -LiteralPath $csvPath)) {
     throw "CSV file not found: $csvPath"
 }
 
-# Compute default output directory from CSV location
 $outDir = Split-Path -Parent $csvPath
-
-# Compute default base name from CSV filename
 $outBase = [System.IO.Path]::GetFileNameWithoutExtension($csvPath)
-
-# Build suggested output XLSX name
 $suggestedXlsxName = $outBase + ".xlsx"
 
-# Prompt for final XLSX output path
 $xlsxPath = Pick-XlsxSavePath -InitialDirectory $outDir -SuggestedFileName $suggestedXlsxName
 
-# Exit on cancel
 if ([string]::IsNullOrWhiteSpace($xlsxPath)) {
     Write-Host "Cancelled (no XLSX save path chosen)." -ForegroundColor Yellow
     return
 }
 
-# Echo selected output path
+# Validate output directory exists (console mode can produce non-existent dirs)
+$outSaveDir = Split-Path -Parent $xlsxPath
+if ([string]::IsNullOrWhiteSpace($outSaveDir) -or -not (Test-Path -LiteralPath $outSaveDir)) {
+    throw "Output directory not found: $outSaveDir"
+}
+
 Write-Host ""
 Write-Host "Output will be written to:" -ForegroundColor Cyan
 Write-Host "  $xlsxPath" -ForegroundColor Cyan
 Write-Host ""
 
-# Initialize COM object holders for cleanup
-$excel = $null
-$wbCsv = $null
-$wbOut = $null
+$excel  = $null
+$wbCsv  = $null
+$wbOut  = $null
 $oldCalc = $null
 
+# Extra COM refs we want to explicitly release
+$wsSrc  = $null
+$usedSrc = $null
+$visible = $null
+
 try {
-    # Create Excel Application COM instance
     Write-Host "Launching Excel (COM)..." -ForegroundColor Cyan
     $excel = New-Object -ComObject Excel.Application
 
-    # Set Excel automation flags
     $excel.Visible = $false
     $excel.DisplayAlerts = $false
     $excel.ScreenUpdating = $false
     $excel.EnableEvents = $false
 
-    # Switch calculation to manual for faster bulk operations
     try {
         $oldCalc = $excel.Calculation
         $excel.Calculation = $xlCalculationManual
     } catch {}
 
-    # Open the CSV as a workbook
     Write-Host "Opening CSV in Excel..." -ForegroundColor Cyan
-    $wbCsv = $excel.Workbooks.Open($csvPath)
+    $wbCsv = Open-CsvWorkbook -ExcelApp $excel -CsvPath $csvPath
 
-    # Read the first worksheet from the CSV workbook
     $wsSrc = $wbCsv.Worksheets.Item(1)
-
-    # Read the used range for the CSV worksheet
     $usedSrc = $wsSrc.UsedRange
 
-    # Handle empty CSV by saving an empty workbook
     if ($null -eq $usedSrc -or $usedSrc.Rows.Count -lt 1) {
         $wbOut = $excel.Workbooks.Add()
         $wsOut = $wbOut.Worksheets.Item(1)
         $wsOut.Name = Sanitize-SheetName $SingleSheetName
-        Apply-WorksheetFormatting -Worksheet $wsOut
+        Apply-WorksheetFormatting -Worksheet $wsOut -AllowFreezeTopRow:$true
 
         if (Test-Path -LiteralPath $xlsxPath) { Remove-Item -LiteralPath $xlsxPath -Force }
         $wbOut.SaveAs($xlsxPath, $xlOpenXMLWorkbook)
@@ -608,10 +622,8 @@ try {
         return
     }
 
-    # Build header map for split column checks
     $hdrMap = Get-HeaderMap -Worksheet $wsSrc
 
-    # Validate that split column exists when split mode is enabled
     if ($splitMode -and -not $hdrMap.ContainsKey($SplitByColumn)) {
         throw "Split column '$SplitByColumn' not found in CSV headers."
     }
@@ -620,154 +632,148 @@ try {
         # ------------------------------
         # Single-sheet mode
         # ------------------------------
-
         Write-Host "Single-sheet mode: formatting and saving..." -ForegroundColor Cyan
 
-        # Rename the sheet
         $wsSrc.Name = Sanitize-SheetName $SingleSheetName
+        Apply-WorksheetFormatting -Worksheet $wsSrc -AllowFreezeTopRow:$true
 
-        # Apply per-sheet formatting
-        Apply-WorksheetFormatting -Worksheet $wsSrc
-
-        # Replace output file if it exists
         if (Test-Path -LiteralPath $xlsxPath) { Remove-Item -LiteralPath $xlsxPath -Force }
-
-        # Save the CSV workbook as XLSX
         $wbCsv.SaveAs($xlsxPath, $xlOpenXMLWorkbook)
-
-    } else {
+    }
+    else {
         # ------------------------------
-        # Split mode: one sheet per PlatformFolder value
+        # Split mode
         # ------------------------------
-
         Write-Host "Split mode: creating destination workbook..." -ForegroundColor Cyan
 
-        # Create destination workbook
         $wbOut = $excel.Workbooks.Add()
 
-        # Track used sheet names to avoid duplicates
         $usedNames = @{}
+        $createdSheetNames = New-Object System.Collections.Generic.List[string]
 
-        # Find the column index of the split column
         $splitColIndex = [int]$hdrMap[$SplitByColumn]
 
-        # Read the row count for unique-value discovery
-        $rowCount = $usedSrc.Rows.Count
+        $rowCount = 0
+        try { $rowCount = $usedSrc.Rows.Count } catch { $rowCount = 0 }
 
-        # Collect unique split keys
-        $values = [System.Collections.Generic.HashSet[string]]::new()
+        $values = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 
-        # Gather unique values (using Value2 for stable comparisons)
         if ($rowCount -ge 2) {
             for ($r = 2; $r -le $rowCount; $r++) {
-                $raw = $wsSrc.Cells.Item($r, $splitColIndex).Value2
-                $v = if ($null -eq $raw) { "" } else { [string]$raw }
-                $v = $v.Trim()
+                $cellText = ""
+                try { $cellText = [string]$wsSrc.Cells.Item($r, $splitColIndex).Text } catch { $cellText = "" }
+
+                $v = Normalize-ExcelTextForKey $cellText
                 if ([string]::IsNullOrWhiteSpace($v)) { $v = "(blank)" }
+
                 [void]$values.Add($v)
             }
         } else {
             [void]$values.Add("(blank)")
         }
 
-        # Materialize unique keys as a sorted list
         $uniqueKeys = @($values) | Sort-Object
 
         # Enable AutoFilter on the source used range (when supported)
         try { $null = $usedSrc.AutoFilter() } catch {}
 
         foreach ($key in $uniqueKeys) {
-            # Build a unique, Excel-safe worksheet name
             $sheetName = Get-UniqueSheetName -Name $key -Used $usedNames
-
-            # Announce the current output sheet
             Write-Host "Writing worksheet: $sheetName" -ForegroundColor Cyan
 
-            # Compute the filter field index relative to the used range start column
             $field = $splitColIndex - $usedSrc.Column + 1
 
-            # Clear existing filters
+            # Reset filter state (best effort)
             try {
                 $wsSrc.AutoFilterMode = $false
                 $null = $usedSrc.AutoFilter()
             } catch {}
 
-            # Apply filter for current key
-            if ($key -eq "(blank)") {
-                $null = $usedSrc.AutoFilter($field, "=")
-            } else {
-                $null = $usedSrc.AutoFilter($field, $key)
+            # Apply filter for current key (best effort; blanks are tricky across locales)
+            $filterOk = $true
+            try {
+                if ($key -eq "(blank)") {
+                    # Prefer empty-string criteria for blanks
+                    $null = $usedSrc.AutoFilter($field, "")
+                } else {
+                    $null = $usedSrc.AutoFilter($field, $key)
+                }
+            } catch {
+                $filterOk = $false
             }
 
-            # Copy visible (filtered) cells
-            $visible = $usedSrc.SpecialCells(12)  # 12 = xlCellTypeVisible
-            $null = $visible.Copy()
+            if (-not $filterOk) {
+                Write-Host "  Skipped (filter failed for key '$key')." -ForegroundColor Yellow
+                Write-Host ""
+                continue
+            }
 
-            # Add destination worksheet
-            $wsDest = $wbOut.Worksheets.Add()
-            $wsDest.Name = $sheetName
+            # Copy visible (filtered) cells — SpecialCells throws if none visible
+            $visible = $null
+            try {
+                $visible = $usedSrc.SpecialCells($xlCellTypeVisible)
+            } catch {
+                Write-Host "  Skipped (no visible rows for key '$key')." -ForegroundColor Yellow
+                Write-Host ""
+                continue
+            }
 
-            # Paste values into destination
-            $null = $wsDest.Range("A1").PasteSpecial(-4163)  # -4163 = xlPasteValues
+            try {
+                $null = $visible.Copy()
 
-            # Paste formats into destination
-            $null = $wsDest.Range("A1").PasteSpecial(-4122)  # -4122 = xlPasteFormats
+                $wsDest = $wbOut.Worksheets.Add()
+                $wsDest.Name = $sheetName
 
-            # Apply per-sheet formatting to destination
-            Apply-WorksheetFormatting -Worksheet $wsDest
+                $null = $wsDest.Range("A1").PasteSpecial($xlPasteValues)
+                $null = $wsDest.Range("A1").PasteSpecial($xlPasteFormats)
 
-            # Emit per-sheet completion status
-            Write-Host "Completed" -ForegroundColor White
-            Write-Host ""
+                # Formatting, but do not attempt freeze panes in split mode
+                Apply-WorksheetFormatting -Worksheet $wsDest -AllowFreezeTopRow:$false
 
-            # Release per-iteration COM references
-            Release-ComObject $wsDest
+                [void]$createdSheetNames.Add($sheetName)
+
+                Write-Host "Completed" -ForegroundColor White
+                Write-Host ""
+
+                Release-ComObject $wsDest
+                $wsDest = $null
+            } finally {
+                if ($visible) { Release-ComObject $visible; $visible = $null }
+            }
         }
 
-        # Reorder worksheets alphabetically (left to right)
+        # Reorder worksheets alphabetically using names (avoid holding worksheet COM objects)
         try {
-            $sorted = @()
+            $sortedNames = $createdSheetNames.ToArray() | Sort-Object
 
-            # Build a list of only the sheets we created (names in $usedNames)
-            foreach ($ws in @($wbOut.Worksheets)) {
-                $nm = [string]$ws.Name
-                if ($usedNames.ContainsKey($nm)) { $sorted += $ws }
-            }
-
-            # Sort by name (case-insensitive)
-            $sorted = $sorted | Sort-Object -Property Name
-
-            # Move in reverse so the final order matches the sorted list
-            for ($i = $sorted.Count - 1; $i -ge 0; $i--) {
-                $sorted[$i].Move($wbOut.Worksheets.Item(1)) | Out-Null
+            for ($i = $sortedNames.Count - 1; $i -ge 0; $i--) {
+                $nm = $sortedNames[$i]
+                try {
+                    $ws = $wbOut.Worksheets.Item($nm)
+                    $ws.Move($wbOut.Worksheets.Item(1)) | Out-Null
+                    Release-ComObject $ws
+                } catch {}
             }
         } catch {}
 
-        # Remove default workbook sheets that were not renamed to a used name
+        # Remove default workbook sheets not created by us (keep at least one sheet)
         for ($i = $wbOut.Worksheets.Count; $i -ge 1; $i--) {
             $ws = $wbOut.Worksheets.Item($i)
             $nm = [string]$ws.Name
 
-            # Delete sheets not present in the used-name set (while keeping at least one sheet)
             if (-not $usedNames.ContainsKey($nm) -and $wbOut.Worksheets.Count -gt 1) {
-                try { $null = $ws.Delete() } catch { $ws.Delete() | Out-Null }
+                try { $null = $ws.Delete() } catch { try { $ws.Delete() | Out-Null } catch {} }
             }
 
-            # Release worksheet COM reference
             Release-ComObject $ws
         }
 
-        # Save the destination workbook
         Write-Host "Saving XLSX..." -ForegroundColor Cyan
 
-        # Replace output file if it exists
         if (Test-Path -LiteralPath $xlsxPath) { Remove-Item -LiteralPath $xlsxPath -Force }
-
-        # Save as .xlsx
         $wbOut.SaveAs($xlsxPath, $xlOpenXMLWorkbook)
     }
 
-    # Print final success message
     Write-Host ""
     Write-Host "Wrote XLSX: $xlsxPath" -ForegroundColor Green
 }
@@ -779,26 +785,32 @@ finally {
         try { $excel.Calculation = $xlCalculationAutomatic } catch {}
     }
 
+    # Release extra COM references if held
+    if ($visible) { try { Release-ComObject $visible } catch {}; $visible = $null }
+    if ($usedSrc) { try { Release-ComObject $usedSrc } catch {}; $usedSrc = $null }
+    if ($wsSrc)   { try { Release-ComObject $wsSrc }   catch {}; $wsSrc   = $null }
+
     # Close destination workbook without prompts
     if ($wbOut) {
         try { $wbOut.Close($false) } catch {}
         Release-ComObject $wbOut
+        $wbOut = $null
     }
 
     # Close source workbook without prompts
     if ($wbCsv) {
         try { $wbCsv.Close($false) } catch {}
         Release-ComObject $wbCsv
+        $wbCsv = $null
     }
 
     # Quit Excel application
     if ($excel) {
         try { $excel.Quit() } catch {}
         Release-ComObject $excel
+        $excel = $null
     }
 
-    # Force garbage collection for COM cleanup
     [GC]::Collect()
     [GC]::WaitForPendingFinalizers()
 }
-
