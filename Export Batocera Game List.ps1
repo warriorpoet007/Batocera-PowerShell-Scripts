@@ -1,6 +1,6 @@
 <#
 PURPOSE: Export a master list of games across Batocera platform folders by reading each platform's gamelist.xml
-VERSION: 1.2
+VERSION: 1.3
 AUTHOR: Devin Kelley, Distant Thunderworks LLC
 
 NOTES:
@@ -800,7 +800,6 @@ foreach ($t in $targets) {
     $hiddenItems  = @($items | Where-Object { $_.Hidden })
     $visibleItems = @($items | Where-Object { -not $_.Hidden })
 
-    # Defensive behavior:
     # - If every entry in a group is hidden, still emit one row (otherwise the group disappears from the report).
     if ($visibleItems.Count -eq 0 -and $items.Count -gt 0) {
       $visibleItems = @($items | Select-Object -First 1)
@@ -824,7 +823,7 @@ foreach ($t in $targets) {
         $isNotGame = ($nameRaw -match '(?i)^\s*ZZZ\(notgame\):')
       }
 
-      $gameFlag = if ($isNotGame) { 'No' } else { 'Yes' }
+      $typeTag = if ($isNotGame) { 'App' } else { 'Game' }
 
       $titleName = $nameStr
       if ($isNotGame) {
@@ -838,8 +837,16 @@ foreach ($t in $targets) {
       if ($pathStr -match '(?i)\.m3u$') {
         $entryType = 'Multi-M3U'
       }
-      elseif ($hiddenItems.Count -gt 0) {
-        $entryType = 'Multi-XML'
+      else {
+        # Multi-XML should only mean "this visible entry has hidden sibling entries in the same group".
+        # This prevents single hidden entries (or all-hidden groups) from being mislabeled as Multi-XML.
+        $hasHidden = ($hiddenItems.Count -gt 0)
+        $hasVisible = ($items.Count -gt $hiddenItems.Count)  # at least one non-hidden exists in group
+        $hasMultiple = ($items.Count -gt 1)
+
+        if ($hasMultiple -and $hasHidden -and $hasVisible) {
+          $entryType = 'Multi-XML'
+        }
       }
 
       $title = Get-TitleForOutput -ResolvedName $titleName
@@ -882,13 +889,16 @@ foreach ($t in $targets) {
       }
 
       # Build output row in the exact column order expected for the CSV export
+      $hiddenMark = if ($g.Hidden) { 'X' } else { '' }
+
       $rows += [pscustomobject]@{
         Title          = $title
         PlatformName   = $platformName
         Manufacturer   = $platformManufacturer
-        'Game?'        = [string]$gameFlag
-        EntryType      = [string]$entryType
+        Type           = [string]$typeTag
+        DiscType       = [string]$entryType
         DiskCount      = [int]$diskCount
+        Hidden         = [string]$hiddenMark
         PlatformFolder = $platformFolder
         FilePath       = $pathStr
         XMLState       = [string]$g.XMLState
