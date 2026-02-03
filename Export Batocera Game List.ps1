@@ -834,6 +834,11 @@ foreach ($t in $targets) {
       Write-Host "Finished platform: $($t.PlatformFolder)" -ForegroundColor Cyan
     }
     continue
+  } else {
+    if ($isRomsRootMode) {
+      $entryLabel = if ($entries.Count -eq 1) { "entry" } else { "entries" }
+      Write-Host ("{0} {1} found." -f $entries.Count, $entryLabel) -ForegroundColor DarkYellow
+    }
   }
 
   # Group entries into "sets" so multi-disk collections can be inferred from:
