@@ -157,9 +157,11 @@ $noM3UNoDisk1Sets              = [System.Collections.ArrayList]::new() # PSCusto
 
 $noM3UNewlyHidden              = [System.Collections.ArrayList]::new() # PSCustomObject { FullPath; Reason }
 $noM3UAlreadyHidden            = [System.Collections.ArrayList]::new() # PSCustomObject { FullPath; Reason }
+$noM3UAlreadyHiddenSet         = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 
 $noM3UNewlyUnhidden            = [System.Collections.ArrayList]::new() # PSCustomObject { FullPath; Reason }
 $noM3UAlreadyVisible           = [System.Collections.ArrayList]::new() # PSCustomObject { FullPath; Reason }
+$noM3UAlreadyVisibleSet        = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 
 $noM3UMissingGamelistEntries   = [System.Collections.ArrayList]::new() # PSCustomObject { FullPath; Reason }
 
@@ -830,7 +832,8 @@ function Hide-GameEntriesInGamelist {
     param(
         [Parameter(Mandatory=$true)]$State,
         [Parameter(Mandatory=$true)]$Targets,
-        [Parameter(Mandatory=$true)][hashtable]$UsedFiles
+        [Parameter(Mandatory=$true)][hashtable]$UsedFiles,
+        [switch]$SuppressAlreadyReport
     )
 
     $result = [PSCustomObject]@{
@@ -922,11 +925,18 @@ function Hide-GameEntriesInGamelist {
 
                 if ($hiddenValue -match '^(?i)true$') {
                     $UsedFiles[$t.FullPath] = $true
-                    [void]$noM3UAlreadyHidden.Add([PSCustomObject]@{
-                        FullPath = $t.FullPath
-                        Reason   = "Already hidden in gamelist.xml"
-                    })
-                    $result.AlreadyHiddenCount++
+
+                    if (-not $SuppressAlreadyReport) {
+
+                        # Micro dedupe safety-net (by FullPath)
+                        if ($noM3UAlreadyHiddenSet.Add([string]$t.FullPath)) {
+                            [void]$noM3UAlreadyHidden.Add([PSCustomObject]@{
+                                FullPath = $t.FullPath
+                                Reason   = "Already hidden in gamelist.xml"
+                            })
+                            $result.AlreadyHiddenCount++
+                        }
+                    }
 
                     # Ensure <name> is positioned above <hidden> within this <game> block
                     $tmpArr = $lines.ToArray()
@@ -1022,7 +1032,8 @@ function Unhide-GameEntriesInGamelist {
     param(
         [Parameter(Mandatory=$true)]$State,
         [Parameter(Mandatory=$true)]$Targets,
-        [Parameter(Mandatory=$true)][hashtable]$UsedFiles
+        [Parameter(Mandatory=$true)][hashtable]$UsedFiles,
+        [switch]$SuppressAlreadyReport
     )
 
     $result = [PSCustomObject]@{
@@ -1141,11 +1152,19 @@ function Unhide-GameEntriesInGamelist {
             else {
 
                 $UsedFiles[$t.FullPath] = $true
-                [void]$noM3UAlreadyVisible.Add([PSCustomObject]@{
-                    FullPath = $t.FullPath
-                    Reason   = "Already visible in gamelist.xml"
-                })
-                $result.AlreadyVisibleCount++
+
+                if (-not $SuppressAlreadyReport) {
+
+                    # Micro dedupe safety-net (by FullPath)
+                    if ($noM3UAlreadyVisibleSet.Add([string]$t.FullPath)) {
+                        [void]$noM3UAlreadyVisible.Add([PSCustomObject]@{
+                            FullPath = $t.FullPath
+                            Reason   = "Already visible in gamelist.xml"
+                        })
+                        $result.AlreadyVisibleCount++
+                    }
+                }
+
                 $handled = $true
                 break
             }
@@ -2043,7 +2062,7 @@ if ($noM3UPlatformMode -ieq "XML") {
         # Apply unhide first (safety: never leave stale hidden behind)
         if ($toUnhide.Count -gt 0) {
 
-            $unhideResult = Unhide-GameEntriesInGamelist -State $state -Targets $toUnhide -UsedFiles $usedFiles
+            $unhideResult = Unhide-GameEntriesInGamelist -State $state -Targets $toUnhide -UsedFiles $usedFiles -SuppressAlreadyReport
 
             $platLabel = $platformLower.ToUpperInvariant()
             if (-not $gamelistUnhiddenCounts.ContainsKey($platLabel)) { $gamelistUnhiddenCounts[$platLabel] = 0 }
@@ -2055,7 +2074,7 @@ if ($noM3UPlatformMode -ieq "XML") {
         # Apply hide for entries that are still expected to be hidden
         if ($toHide.Count -gt 0) {
 
-            $hideResult = Hide-GameEntriesInGamelist -State $state -Targets $toHide -UsedFiles $usedFiles
+            $hideResult = Hide-GameEntriesInGamelist -State $state -Targets $toHide -UsedFiles $usedFiles -SuppressAlreadyReport
 
             $platLabel = $platformLower.ToUpperInvariant()
             if (-not $gamelistHiddenCounts.ContainsKey($platLabel)) { $gamelistHiddenCounts[$platLabel] = 0 }
@@ -2269,9 +2288,10 @@ if (-not $anyM3UActivity -and -not $anyGamelistActivity) {
         if (@($noM3UAlreadyVisible).Count -gt 0) {
             Write-Host ""
             Write-Host "ENTRIES ALREADY VISIBLE (NO CHANGE)" -ForegroundColor Green
-            $noM3UAlreadyVisible | Sort-Object FullPath | ForEach-Object {
-                Write-Host "$($_.FullPath)" -NoNewline
-                Write-Host " — $($_.Reason)" -ForegroundColor Yellow
+            $noM3UAlreadyVisible | Sort-Object FullPath | Group-Object FullPath | ForEach-Object {
+                $x = $_.Group[0]
+                Write-Host "$($x.FullPath)" -NoNewline
+                Write-Host " — $($x.Reason)" -ForegroundColor Yellow
             }
         }
 
