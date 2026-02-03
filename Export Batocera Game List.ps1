@@ -87,6 +87,50 @@ $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $startDir  = $scriptDir
 
 # --------------------------------------------------------------------------------------------------
+# Runtime tracking
+# PURPOSE:
+# - Provide a consistent runtime report using the same formatting rules as the Generate List script:
+#     - <60s  => "X seconds"
+#     - <60m  => "M:SS"
+#     - >=60m => "H:MM:SS"
+# --------------------------------------------------------------------------------------------------
+$__runtimeStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
+function Format-ElapsedRuntime {
+  param([Parameter(Mandatory=$true)][TimeSpan]$Elapsed)
+
+  if ($Elapsed.TotalSeconds -lt 60) {
+    $sec = [int][math]::Floor($Elapsed.TotalSeconds)
+    return ("{0} seconds" -f $sec)
+  }
+
+  if ($Elapsed.TotalMinutes -lt 60) {
+    $min = [int][math]::Floor($Elapsed.TotalMinutes)
+    $sec = [int]$Elapsed.Seconds
+    return ("{0}:{1:00}" -f $min, $sec)
+  }
+
+  $hrs = [int][math]::Floor($Elapsed.TotalHours)
+  $min = [int]$Elapsed.Minutes
+  $sec = [int]$Elapsed.Seconds
+  return ("{0}:{1:00}:{2:00}" -f $hrs, $min, $sec)
+}
+
+function Write-RuntimeReport {
+  param([switch]$Stop)
+
+  if ($null -eq $__runtimeStopwatch) { return }
+
+  try {
+    if ($Stop -and $__runtimeStopwatch.IsRunning) { $__runtimeStopwatch.Stop() }
+    $rt = Format-ElapsedRuntime -Elapsed $__runtimeStopwatch.Elapsed
+    Write-Host ("Runtime: {0}" -f $rt) -ForegroundColor DarkGray
+  } catch {
+    # Intentionally ignore runtime reporting failures
+  }
+}
+
+# --------------------------------------------------------------------------------------------------
 # Phase output helper
 # PURPOSE:
 # - Emit clear, consistent phase/progress messages to the console
@@ -750,6 +794,7 @@ $targets = @(Get-PlatformTargets -StartDir $startDir)
 
 if (@($targets).Count -eq 0) {
   Write-Warning "No gamelist.xml found. Run from /roms or a platform folder that contains gamelist.xml."
+  Write-RuntimeReport -Stop
   return
 }
 
@@ -940,6 +985,7 @@ if (Test-Path -LiteralPath $outPath) {
     Write-Host ""
     Write-Host "Cannot write 'Game List.csv' because the existing file is locked (likely open in Excel)." -ForegroundColor Yellow
     Write-Host "Script aborted." -ForegroundColor Yellow
+    Write-RuntimeReport -Stop
     return
   }
 }
@@ -996,3 +1042,4 @@ if ($malformedPlatforms.Count -gt 0) {
 Write-Phase "Finished."
 Write-Host "CSV written to: $outPath" -ForegroundColor Green
 Write-Host "Total games exported: $(@($rows).Count)" -ForegroundColor Green
+Write-RuntimeReport -Stop
