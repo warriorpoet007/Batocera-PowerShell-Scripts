@@ -1,12 +1,14 @@
 <#
 PURPOSE: Converts the CSV exported by the "Export Batocera Game List.ps1" script into an Excel .xlsx workbook
-VERSION: 1.1
+VERSION: 1.2
 AUTHOR: Devin Kelley, Distant Thunderworks LLC
 
 USER PROMPTS:
   1) Split into separate worksheets per PlatformFolder? (Yes/No)
   2) Choose CSV file to convert (GUI dialog when possible; console fallback otherwise)
   3) Choose where to save XLSX (GUI dialog when possible; console fallback otherwise)
+
+NOTE: if you don't see a prompt, in some cases it may appear behind the PowerShell window so ALT-TAB to it
 
 OUTPUT:
   - Saves an .xlsx workbook to the user-selected location.
@@ -48,6 +50,50 @@ param(
 )
 
 # -------------------------------------------------------------------------------------------------
+# Runtime tracking
+# PURPOSE:
+# - Provide a consistent runtime report using the same formatting rules as the Generate List script:
+#     - <60s  => "X seconds"
+#     - <60m  => "M:SS"
+#     - >=60m => "H:MM:SS"
+# -------------------------------------------------------------------------------------------------
+$__runtimeStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
+function Format-ElapsedRuntime {
+    param([Parameter(Mandatory=$true)][TimeSpan]$Elapsed)
+
+    if ($Elapsed.TotalSeconds -lt 60) {
+        $sec = [int][math]::Floor($Elapsed.TotalSeconds)
+        return ("{0} seconds" -f $sec)
+    }
+
+    if ($Elapsed.TotalMinutes -lt 60) {
+        $min = [int][math]::Floor($Elapsed.TotalMinutes)
+        $sec = [int]$Elapsed.Seconds
+        return ("{0}:{1:00}" -f $min, $sec)
+    }
+
+    $hrs = [int][math]::Floor($Elapsed.TotalHours)
+    $min = [int]$Elapsed.Minutes
+    $sec = [int]$Elapsed.Seconds
+    return ("{0}:{1:00}:{2:00}" -f $hrs, $min, $sec)
+}
+
+function Write-RuntimeReport {
+    param([switch]$Stop)
+
+    if ($null -eq $__runtimeStopwatch) { return }
+
+    try {
+        if ($Stop -and $__runtimeStopwatch.IsRunning) { $__runtimeStopwatch.Stop() }
+        $rt = Format-ElapsedRuntime -Elapsed $__runtimeStopwatch.Elapsed
+        Write-Host ("Runtime: {0}" -f $rt) -ForegroundColor DarkGray
+    } catch {
+        # Intentionally ignore runtime reporting failures
+    }
+}
+
+# -------------------------------------------------------------------------------------------------
 # Verify Microsoft Excel is installed before doing anything else
 # -------------------------------------------------------------------------------------------------
 try {
@@ -59,6 +105,7 @@ try {
     Write-Host "Microsoft Excel does not appear to be installed on this system." -ForegroundColor Red
     Write-Host "This script requires the desktop version of Excel to generate XLSX files." -ForegroundColor Red
     Write-Host ""
+    Write-RuntimeReport -Stop
     return
 }
 
@@ -550,6 +597,7 @@ $csvPath = Pick-CsvFile
 
 if ([string]::IsNullOrWhiteSpace($csvPath)) {
     Write-Host "Cancelled (no CSV selected)." -ForegroundColor Yellow
+    Write-RuntimeReport -Stop
     return
 }
 
@@ -565,6 +613,7 @@ $xlsxPath = Pick-XlsxSavePath -InitialDirectory $outDir -SuggestedFileName $sugg
 
 if ([string]::IsNullOrWhiteSpace($xlsxPath)) {
     Write-Host "Cancelled (no XLSX save path chosen)." -ForegroundColor Yellow
+    Write-RuntimeReport -Stop
     return
 }
 
@@ -619,6 +668,7 @@ try {
         $wbOut.SaveAs($xlsxPath, $xlOpenXMLWorkbook)
 
         Write-Host "Wrote XLSX (empty input): $xlsxPath" -ForegroundColor Green
+        Write-RuntimeReport -Stop
         return
     }
 
@@ -776,6 +826,7 @@ try {
 
     Write-Host ""
     Write-Host "Wrote XLSX: $xlsxPath" -ForegroundColor Green
+    Write-RuntimeReport -Stop
 }
 finally {
     # Restore Excel calculation mode when available
