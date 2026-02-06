@@ -3,7 +3,7 @@ PURPOSE: Create .m3u files for each multi-disk game and insert the list of game 
 VERSION: 1.8
 AUTHOR: Devin Kelley, Distant Thunderworks LLC
 
-NOTES:
+USAGE:
 - Requires PowerShell version 7+
 
 - Place this file into the ROMS folder to process all platforms, or in a platform's individual subfolder to process just that one.
