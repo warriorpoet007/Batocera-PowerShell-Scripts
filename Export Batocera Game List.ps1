@@ -1,35 +1,17 @@
 <#
-PURPOSE: Export a master list of games across Batocera platform folders by reading each platform's gamelist.xml
+PURPOSE: Export a list of games/apps for Batocera platform folders by reading each platform's gamelist.xml
 VERSION: 1.3
 AUTHOR: Devin Kelley, Distant Thunderworks LLC
 
 NOTES:
 - Place this file into the ROMS folder to process all platforms, or in a platform's individual subfolder to process just that one.
-- This script does NOT modify any files; it only reads gamelist.xml and produces a CSV report.
-- Output CSV is written to the same directory where the PS1 script resides.
-- If "Game List.csv" already exists in the output folder, it is deleted and replaced with a newly generated file.
-- Multi-disk detection is inferred as:
-    - Multi-M3U: the visible entry’s <path> ends in .m3u
-    - Multi-XML: the visible entry has 1+ additional entries with the same group key where <hidden>true</hidden> is set
-        - This is tailored to be run after first running the Generate Batocera Playlists.ps1 script
-        - Ensure that each disk listed in gamelist.xml is tagged with the same <name>Name Of the Game</name>
-    - Single: neither of the above
-- Robustness:
-    - Some gamelist.xml files in the wild can be malformed (mismatched tags, partial writes, etc.).
-    - This script will attempt a normal XML parse first, and if that fails it will fall back to a "salvage mode"
-      that extracts <game>...</game> blocks and parses them individually.
-- Identifies non-game ROMs via entries that include "ZZZ(notgame):" in the <name> tag in gamelist.xml
-    - Removes "ZZZ(notgame):" before it writes the Title
-    - Designates this ROM type with a "Game?" column in the CSV file, with a "No" (listings with "Yes" are games)
-- XMLState column:
-    - Normal: gamelist.xml parsed cleanly as a complete XML document
-    - Malformed: gamelist.xml was malformed; entries were extracted by parsing <game> fragments
-- Progress / phase output:
-    - Prints only major phase steps
-    - If running from ROMS root (multi-platform mode), prints per-platform start + finished lines
-    - Always prints a final "finished" summary
 
-IMPORTANT NOTE
+- This script does NOT modify any files; it only reads gamelist.xml and produces a CSV report.
+
+- Output CSV is written to the same directory where the PS1 script resides.
+    - If "Game List.csv" already exists in the output folder, it is deleted and replaced with a newly generated file.
+
+IMPORTANT NOTE:
 - For non-M3U multi-disk games, they must each have the same name in gamelist.xml, as this is what's used by the script to group them
     - Generate Batocera Playlists.ps1 does attempt to do this by populating <name> in gamelist.xml, but this note is here for awareness
     - In the example below, a game with three disks/filenames/paths are all part of the same game with the same name:
@@ -43,18 +25,47 @@ IMPORTANT NOTE
         <path>./Game ROM Image (Disk 3).chd</path>
         <name>Name Of the Game</name>
 
-BREAKDOWN
+BREAKDOWN:
+- Multi-disk detection is inferred as:
+    - Multi-M3U: the visible entry’s <path> ends in .m3u
+    - Multi-XML: the visible entry has 1+ additional entries with the same group key where <hidden>true</hidden> is set
+        - This is tailored to be run after first running the Generate Batocera Playlists.ps1 script
+        - Ensure that each disk listed in gamelist.xml is tagged with the same <name>Name Of the Game</name>
+    - Single: neither of the above
+
+- Gamelist.xml Repair:
+    - Some gamelist.xml files in the wild can be malformed (mismatched tags, partial writes, etc.).
+    - This script will attempt a normal XML parse first, and if that fails it will fall back to a "salvage mode"
+      that extracts <game>...</game> blocks and parses them individually.
+
+- Identifies non-game ROMs via entries that include "ZZZ(notgame):" in the <name> tag in gamelist.xml
+    - Removes "ZZZ(notgame):" before it writes the Title
+    - Designates this ROM type with a "Game?" column in the CSV file, with a "No" (listings with "Yes" are games)
+
+- XMLState column:
+    - Normal: gamelist.xml parsed cleanly as a complete XML document
+    - Malformed: gamelist.xml was malformed; entries were extracted by parsing <game> fragments
+
+- Progress / phase output:
+    - Prints only major phase steps
+    - If running from ROMS root (multi-platform mode), prints per-platform start + finished lines
+    - Always prints a final "finished" summary
+
 - Determines runtime mode based on where the script is located:
     - If a gamelist.xml exists in the script directory, treat it as a single-platform run
     - Otherwise, treat the script directory as ROMS root and scan all first-level subfolders for gamelist.xml
+
 - Reads each discovered gamelist.xml and extracts per-game fields:
     - Name (from <name>, with filename fallback if <name> is missing)
     - Path (from <path>)
     - Hidden (from <hidden>, if present; defaults to false)
+
 - Uses a stable group key for multi-disk inference:
     - Primary: <name>
     - Fallback: <path> when <name> is missing/blank (prevents unrelated entries from collapsing into one group)
+
 - Groups entries by the group key to infer multi-disk sets and produce a single row per visible entry
+
 - Generates additional derived columns:
     - Title (Title Case derived from the name; uses safe fallbacks when name is missing)
     - PlatformName (friendly platform name derived from the platform folder)
@@ -65,6 +76,7 @@ BREAKDOWN
         - Multi-XML: total entries in the group (visible + hidden)
         - Single: 1
     - XMLState (Normal or Malformed)
+
 - Deletes any existing "Game List.csv" in the output folder and writes a newly generated "Game List.csv"
 #>
 
@@ -124,7 +136,7 @@ function Write-RuntimeReport {
   try {
     if ($Stop -and $__runtimeStopwatch.IsRunning) { $__runtimeStopwatch.Stop() }
     $rt = Format-ElapsedRuntime -Elapsed $__runtimeStopwatch.Elapsed
-    Write-Host ("Runtime: {0}" -f $rt) -ForegroundColor DarkGray
+    Write-Host ("Runtime: {0}" -f $rt) -ForegroundColor DarkYellow
   } catch {
     # Intentionally ignore runtime reporting failures
   }
