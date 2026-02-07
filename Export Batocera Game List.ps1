@@ -1,6 +1,6 @@
 <#
 PURPOSE: Export a list of games/apps for Batocera platform folders by reading each platform's gamelist.xml
-VERSION: 1.3
+VERSION: 1.4
 AUTHOR: Devin Kelley, Distant Thunderworks LLC
 
 NOTES:
@@ -34,6 +34,7 @@ BREAKDOWN:
     - Multi-XML: the visible entry has 1+ additional entries with the same group key where <hidden>true</hidden> is set
         - This is tailored to be run after first running the Generate Batocera Playlists.ps1 script
         - Ensure that each disk listed in gamelist.xml is tagged with the same <name>Name Of the Game</name>
+        - NOTE: Entries whose <name> contain 'ZZZ(notgame):' are treated as non-groupable and exported individually
     - Single: neither of the above
 
 - Gamelist.xml Repair:
@@ -708,11 +709,12 @@ function Read-Gamelist {
         $hidden = Get-XmlNodeText -Node $node -ChildName 'hidden'
 
         $resolvedName = Get-DisplayNameFallback -Name $name -Path $path
-
         # GroupKey determines multi-disk grouping:
         # - Prefer the raw <name> when present (stable grouping)
         # - Fall back to path when name is missing to avoid unrelated collisions
-        $groupKey     = if (-not [string]::IsNullOrWhiteSpace($name)) { $name.Trim() } else { [string]$path }
+        # NON-GROUPABLE NOTGAME: Force unique GroupKey when ScreenScraper marks entry as ZZZ(notgame):*
+        $nonGroupableNotGame = (-not [string]::IsNullOrWhiteSpace($name)) -and ($name.Trim() -like '*ZZZ(notgame):*')
+        $groupKey     = if ($nonGroupableNotGame) { "__NONGROUP__:" + [string]$path } elseif (-not [string]::IsNullOrWhiteSpace($name)) { $name.Trim() } else { [string]$path }
 
         $out += [pscustomobject]@{
           PlatformFolder = $PlatformFolder
@@ -763,7 +765,10 @@ function Read-Gamelist {
     $hidden = Get-XmlNodeText -Node $node -ChildName 'hidden'
 
     $resolvedName = Get-DisplayNameFallback -Name $name -Path $path
-    $groupKey     = if (-not [string]::IsNullOrWhiteSpace($name)) { $name.Trim() } else { [string]$path }
+
+    # NON-GROUPABLE NOTGAME: Force unique GroupKey when ScreenScraper marks entry as ZZZ(notgame):*
+    $nonGroupableNotGame = (-not [string]::IsNullOrWhiteSpace($name)) -and ($name.Trim() -like '*ZZZ(notgame):*')
+    $groupKey     = if ($nonGroupableNotGame) { "__NONGROUP__:" + [string]$path } elseif (-not [string]::IsNullOrWhiteSpace($name)) { $name.Trim() } else { [string]$path }
 
     $out += [pscustomobject]@{
       PlatformFolder = $PlatformFolder
